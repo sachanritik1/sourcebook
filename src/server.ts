@@ -2,6 +2,7 @@ import "dotenv/config";
 import { createApp } from "./app";
 import { createPool } from "./db/pool";
 import IORedis from "ioredis";
+import { Queue } from "bullmq";
 import { createEmbeddingProvider } from "./ai/embeddings";
 import { FixedWindowLimiter } from "./rate-limit/fixed-window";
 import { createAnswerProvider } from "./ai/answers";
@@ -9,6 +10,7 @@ import {
   configuredRateLimit,
   configuredTrustProxyHops,
 } from "./rate-limit/middleware";
+import { QUEUE_NAME } from "./processing/types";
 
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) throw new Error("DATABASE_URL is required");
@@ -22,6 +24,10 @@ const redis = new IORedis(redisUrl, {
 });
 const embeddings = createEmbeddingProvider();
 const answers = createAnswerProvider();
+const metricsToken = process.env.METRICS_TOKEN;
+const metricsQueue = metricsToken
+  ? new Queue(QUEUE_NAME, { connection: redis })
+  : null;
 const port = Number(process.env.PORT ?? 3000);
 const server = createApp(pool, {
   embeddings,
@@ -39,10 +45,15 @@ const server = createApp(pool, {
     "auth-limit",
   ),
   trustProxyHops: configuredTrustProxyHops(),
+  metrics:
+    metricsToken && metricsQueue
+      ? { queue: metricsQueue, token: metricsToken }
+      : undefined,
 }).listen(port, () => console.info(`API listening on ${port}`));
 
 async function shutdown() {
   server.close();
+  await metricsQueue?.close();
   await pool.end();
   await redis.quit();
 }

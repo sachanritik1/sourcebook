@@ -820,6 +820,110 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
     expect(await limiter.take(randomUUID())).toBe(true);
   });
 
+  it("protects operational metrics and reports persisted work and usage", async () => {
+    const token = "test-metrics-token-with-at-least-32-characters";
+    const meteredAnswers: AnswerProvider = {
+      model: "metered-test-answer",
+      inputUsdPerMillionTokens: 1,
+      outputUsdPerMillionTokens: 1,
+      answer: async (question, chunks) => ({
+        ...(await answers.answer(question, chunks)),
+        inputTokens: 12,
+        outputTokens: 3,
+      }),
+    };
+    const metricsApp = createApp(pool!, {
+      embeddings,
+      limiter: new FixedWindowLimiter(redis!, 1000, "metrics-search-test"),
+      answers: meteredAnswers,
+      answerLimiter: new FixedWindowLimiter(
+        redis!,
+        1000,
+        "metrics-answer-test",
+      ),
+      metrics: { queue: queue!, token },
+    });
+    await request(metricsApp).get("/internal/metrics").expect(401);
+    await request(metricsApp)
+      .get("/internal/metrics")
+      .auth("wrong-token", { type: "bearer" })
+      .expect(401);
+    const empty = await request(metricsApp)
+      .get("/internal/metrics")
+      .auth(token, { type: "bearer" })
+      .expect(200);
+    expect(empty.body.jobs.averageEndToEndMs).toBeNull();
+    expect(empty.body.usage.averageAnswerLatencyMs).toBeNull();
+    const unavailableApp = createApp(pool!, {
+      embeddings,
+      limiter: new FixedWindowLimiter(redis!, 1000, "metrics-error-test"),
+      metrics: {
+        token,
+        queue: {
+          getJobCounts: async () => {
+            throw new Error("Redis unavailable");
+          },
+        },
+      },
+    });
+    const unavailable = await request(unavailableApp)
+      .get("/internal/metrics")
+      .auth(token, { type: "bearer" })
+      .expect(503);
+    expect(unavailable.body.error).toBe("metrics_unavailable");
+
+    const { owner, workspaceId } = await setup();
+    const upload = await request(app!)
+      .post(`/workspaces/${workspaceId}/documents`)
+      .set("Idempotency-Key", randomUUID())
+      .auth(owner.body.token, { type: "bearer" })
+      .attach("file", Buffer.from("A reliable answer comes from a document."), {
+        filename: "metrics.txt",
+        contentType: "text/plain",
+      })
+      .expect(202);
+    const event = await pool!.query(
+      "SELECT payload FROM outbox_events WHERE job_id = $1",
+      [upload.body.jobId],
+    );
+    await processDocumentEvent(
+      pool!,
+      event.rows[0].payload as DocumentEvent,
+      1,
+      embeddings,
+    );
+    await request(metricsApp)
+      .post(`/workspaces/${workspaceId}/questions`)
+      .auth(owner.body.token, { type: "bearer" })
+      .send({ question: "Where does a reliable answer come from?" })
+      .expect(200);
+    await pool!.query(
+      "UPDATE processing_jobs SET attempts_made = 2 WHERE id = $1",
+      [upload.body.jobId],
+    );
+    const metrics = await request(metricsApp)
+      .get("/internal/metrics")
+      .auth(token, { type: "bearer" })
+      .expect(200);
+    expect(metrics.body.queue.waiting).toBe(0);
+    expect(metrics.body.jobs).toMatchObject({
+      queued: 0,
+      completed: 1,
+      failed: 0,
+      retryAttemptsCurrentEvent: 1,
+    });
+    expect(metrics.body.jobs.averageEndToEndMs).toBeGreaterThanOrEqual(0);
+    expect(metrics.body.outbox.pending).toBe(1);
+    expect(metrics.body.usage).toMatchObject({ answerCalls: 1 });
+    expect(metrics.body.usage.answerInputTokens).toBe(12);
+    expect(metrics.body.usage.answerOutputTokens).toBe(3);
+    expect(metrics.body.usage.averageAnswerLatencyMs).toBeGreaterThanOrEqual(0);
+    const stored = await pool!.query(
+      "SELECT provider_latency_ms FROM usage_events WHERE operation = 'llm_answer'",
+    );
+    expect(stored.rows[0].provider_latency_ms).toBeGreaterThanOrEqual(0);
+  });
+
   it("extracts text from a real PDF byte stream", async () => {
     expect(await extractText(samplePdf(), "application/pdf")).toContain(
       "Reliable document processing",

@@ -14,6 +14,8 @@ import type { EmbeddingProvider } from "./ai/embeddings";
 import type { RateCounter } from "./rate-limit/fixed-window";
 import type { AnswerProvider } from "./ai/answers";
 import { ipRateLimit } from "./rate-limit/middleware";
+import type { Queue } from "bullmq";
+import { metricsRoutes } from "./observability/metrics";
 
 export function createApp(
   pool: Pool,
@@ -25,6 +27,7 @@ export function createApp(
     publicLimiter?: RateCounter;
     authLimiter?: RateCounter;
     trustProxyHops?: number;
+    metrics?: { queue: Pick<Queue, "getJobCounts">; token: string };
   },
 ) {
   const app = express();
@@ -63,6 +66,10 @@ export function createApp(
     await pool.query("SELECT 1");
     res.json({ status: "ok" });
   });
+  if (services?.metrics)
+    app.use(
+      metricsRoutes(pool, services.metrics.queue, services.metrics.token),
+    );
   if (services?.publicLimiter)
     app.use(ipRateLimit(services.publicLimiter, "api_rate_limited", "allow"));
   app.use(express.json({ limit: "32kb" }));

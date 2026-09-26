@@ -225,8 +225,8 @@ export function aiRoutes(
       }
       const llmLatencyMs = Date.now() - llmStarted;
       await pool.query(
-        `INSERT INTO usage_events (workspace_id, event_key, operation, model, input_tokens, output_tokens, estimated_cost_usd)
-       VALUES ($1, $2, 'llm_answer', $3, $4, $5, $6)`,
+        `INSERT INTO usage_events (workspace_id, event_key, operation, model, input_tokens, output_tokens, estimated_cost_usd, provider_latency_ms)
+       VALUES ($1, $2, 'llm_answer', $3, $4, $5, $6, $7)`,
         [
           workspaceId,
           randomUUID(),
@@ -234,6 +234,7 @@ export function aiRoutes(
           draft.inputTokens,
           draft.outputTokens,
           answerCostUsd(draft, answers),
+          llmLatencyMs,
         ],
       );
       let grounded;
