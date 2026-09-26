@@ -1,6 +1,6 @@
 # Document research platform
 
-An incremental, multi-tenant document research platform. **Current slice:** authentication, workspaces, a browser research desk, private PDF/text uploads with idempotent retries, transactional outbox, workspace backlog control, BullMQ extraction and embedding, pgvector search, grounded answers with citations, API and provider rate limits, operational metrics, job progress, retries, dead-letter records, and approximate token usage. The browser currently covers sign-in and workspaces; document and question screens come later.
+An incremental, multi-tenant document research platform. **Current slice:** authentication, workspaces, a browser research desk with document uploads and job progress, private PDF/text uploads with idempotent retries, transactional outbox, workspace backlog control, BullMQ extraction and embedding, pgvector search, grounded answers with citations, API and provider rate limits, operational metrics, retries, dead-letter records, and approximate token usage. The browser question screen comes later.
 
 ## Local setup
 
@@ -11,7 +11,7 @@ docker compose up --build -d
 curl http://localhost:3000/health/ready
 ```
 
-Open [http://localhost:3001](http://localhost:3001) to create an account and workspace. The browser app stores the API session in an encrypted HttpOnly cookie. Compose includes a development-only cookie key; set `WEB_SESSION_KEY` to `openssl rand -hex 32` in `.env` before sharing an environment. For local web development, run `npm ci --prefix web && npm run dev --prefix web` with `API_BASE_URL=http://localhost:3000`, `WEB_PUBLIC_ORIGIN=http://localhost:3001`, and `WEB_SESSION_KEY` set.
+Open [http://localhost:3001](http://localhost:3001) to create an account and workspace. Open a workspace to upload PDF/text files, watch jobs, and retry failures. The browser app stores the API session in an encrypted HttpOnly cookie. Compose includes a development-only cookie key; set `WEB_SESSION_KEY` to `openssl rand -hex 32` in `.env` before sharing an environment. For local web development, run `npm ci --prefix web && npm run dev --prefix web` with `API_BASE_URL=http://localhost:3000`, `WEB_PUBLIC_ORIGIN=http://localhost:3001`, and `WEB_SESSION_KEY` set.
 
 For local API development, run `docker compose up -d postgres redis`, copy `.env.example` to `.env`, then `npm ci && npm run migrate && npm run dev`.
 
@@ -89,7 +89,7 @@ flowchart LR
   API --> LLM[Answer provider]
 ```
 
-PostgreSQL is the authority for identities, memberships, jobs, processed-event records, vectors, and usage. [ADR 0001](docs/adr/0001-workspace-boundary.md) records tenant isolation; [ADR 0002](docs/adr/0002-outbox-processing.md) explains delivery guarantees; [ADR 0003](docs/adr/0003-embeddings-and-search.md) explains vector checkpointing and search; [ADR 0004](docs/adr/0004-grounded-answers.md) explains citation validation and answer cost; [ADR 0005](docs/adr/0005-workspace-admission.md) explains workspace backlog limits; [ADR 0006](docs/adr/0006-upload-idempotency.md) explains upload retry safety; [ADR 0007](docs/adr/0007-api-rate-limits.md) explains edge limits and Redis outages; [ADR 0008](docs/adr/0008-operational-metrics.md) explains operational metrics; [ADR 0009](docs/adr/0009-provider-budget.md) explains provider capacity; [ADR 0010](docs/adr/0010-browser-session-boundary.md) explains the browser session boundary. Request, event, and job IDs appear in structured logs.
+PostgreSQL is the authority for identities, memberships, jobs, processed-event records, vectors, and usage. [ADR 0001](docs/adr/0001-workspace-boundary.md) records tenant isolation; [ADR 0002](docs/adr/0002-outbox-processing.md) explains delivery guarantees; [ADR 0003](docs/adr/0003-embeddings-and-search.md) explains vector checkpointing and search; [ADR 0004](docs/adr/0004-grounded-answers.md) explains citation validation and answer cost; [ADR 0005](docs/adr/0005-workspace-admission.md) explains workspace backlog limits; [ADR 0006](docs/adr/0006-upload-idempotency.md) explains upload retry safety; [ADR 0007](docs/adr/0007-api-rate-limits.md) explains edge limits and Redis outages; [ADR 0008](docs/adr/0008-operational-metrics.md) explains operational metrics; [ADR 0009](docs/adr/0009-provider-budget.md) explains provider capacity; [ADR 0010](docs/adr/0010-browser-session-boundary.md) explains the browser session boundary; [ADR 0011](docs/adr/0011-browser-upload-and-jobs.md) explains browser upload retries and job polling. Request, event, and job IDs appear in structured logs.
 
 ## Verification
 
@@ -100,6 +100,7 @@ npm run format:check
 npm run typecheck --prefix web
 npm run test --prefix web
 npm run build --prefix web
+npm run smoke --prefix web # requires the running Compose stack; creates test accounts and documents
 docker compose exec postgres createdb -U app research_test
 TEST_DATABASE_URL=postgres://app:app@localhost:5433/research_test \
   TEST_REDIS_URL=redis://localhost:6380 npm run test:integration
@@ -128,3 +129,5 @@ For provider capacity, use a non-production provider key and set `EMBEDDING_REQU
 For provider 429 handling, the integration tests inject a temporary 429 with `Retry-After` and a credit-exhaustion 429. Check that the temporary error keeps its bounded retry count, while credit exhaustion immediately sets the PostgreSQL job to `failed` and creates a dead-letter record. Replaying that event must leave it failed; only manual retry with a new event can resume it.
 
 For the browser boundary, sign in and create a workspace at port 3001, then refresh: the session and workspace persist. Sign in as a second user in a private window: the first workspace must be absent. Tamper with the `sourcebook_session` cookie in browser dev tools and refresh: access should return 401. A cross-origin POST to `/api/workspaces` should return 403.
+
+For browser upload recovery, select one text file, stop the web container while its request is in flight, then restart it and retry the draft in the same tab if it remains available. The API should return the same IDs when the first attempt committed. If the tab was closed, check the document list before selecting the file again: the browser no longer has the original key. Upload a file containing `%PDF-broken` as a PDF to see a failed job and its Retry action.

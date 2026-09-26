@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useState } from "react";
+import ResearchWorkspace from "./research-workspace";
 
 type Workspace = { id: string; name: string; role: string };
 type Identity = { userId: string; email: string };
@@ -26,6 +27,9 @@ function errorMessage(
 export default function Home() {
   const [identity, setIdentity] = useState<Identity | null>(null);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [selectedWorkspace, setSelectedWorkspace] = useState<Workspace | null>(
+    null,
+  );
   const [checking, setChecking] = useState(true);
   const [busy, setBusy] = useState(false);
   const [mode, setMode] = useState<"login" | "register">("login");
@@ -39,6 +43,7 @@ export default function Home() {
     if (response.status === 401) {
       setIdentity(null);
       setWorkspaces([]);
+      setSelectedWorkspace(null);
       return;
     }
     const payload = await json(response);
@@ -105,6 +110,10 @@ export default function Home() {
       if (!response.ok) throw new Error(errorMessage(response.status, payload));
       setWorkspaceName("");
       await loadWorkspaces();
+      setSelectedWorkspace({
+        ...(payload as { id: string; name: string }),
+        role: "owner",
+      });
     } catch (error) {
       setMessage(
         error instanceof Error ? error.message : "Could not create workspace.",
@@ -122,6 +131,7 @@ export default function Home() {
       if (!response.ok) throw new Error("Could not sign out. Try again.");
       setIdentity(null);
       setWorkspaces([]);
+      setSelectedWorkspace(null);
     } catch (error) {
       setMessage(
         error instanceof Error ? error.message : "Could not sign out.",
@@ -179,6 +189,17 @@ export default function Home() {
           <p className="muted" role="status">
             Opening your desk…
           </p>
+        ) : identity && selectedWorkspace ? (
+          <ResearchWorkspace
+            key={selectedWorkspace.id}
+            workspace={selectedWorkspace}
+            onBack={() => setSelectedWorkspace(null)}
+            onUnauthorized={() => {
+              setIdentity(null);
+              setWorkspaces([]);
+              setSelectedWorkspace(null);
+            }}
+          />
         ) : identity ? (
           <section className="desk" aria-labelledby="desk-title">
             <div className="section-heading">
@@ -202,7 +223,12 @@ export default function Home() {
               <div className="workspace-list">
                 {workspaces.length ? (
                   workspaces.map((workspace, index) => (
-                    <div className="workspace-row" key={workspace.id}>
+                    <button
+                      className="workspace-row"
+                      type="button"
+                      key={workspace.id}
+                      onClick={() => setSelectedWorkspace(workspace)}
+                    >
                       <span className="row-index">
                         {String(index + 1).padStart(2, "0")}
                       </span>
@@ -212,7 +238,10 @@ export default function Home() {
                           {workspace.role} · {workspace.id.slice(0, 8)}
                         </span>
                       </div>
-                    </div>
+                      <span className="workspace-open" aria-hidden="true">
+                        ↗
+                      </span>
+                    </button>
                   ))
                 ) : (
                   <div className="empty-state">
