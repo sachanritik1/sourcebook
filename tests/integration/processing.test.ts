@@ -8,7 +8,7 @@ import {
   LocalLexicalEmbeddings,
   type EmbeddingProvider,
 } from "../../src/ai/embeddings";
-import { SearchLimiter } from "../../src/ai/search-limiter";
+import { FixedWindowLimiter } from "../../src/rate-limit/fixed-window";
 import {
   citedAnswer,
   InvalidCitationError,
@@ -64,9 +64,9 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
     pool && redis
       ? createApp(pool, {
           embeddings,
-          limiter: new SearchLimiter(redis, 1000),
+          limiter: new FixedWindowLimiter(redis, 1000, "search-test"),
           answers,
-          answerLimiter: new SearchLimiter(redis, 1000, "question-test"),
+          answerLimiter: new FixedWindowLimiter(redis, 1000, "question-test"),
         })
       : null;
 
@@ -666,9 +666,9 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
     };
     const badApp = createApp(pool!, {
       embeddings,
-      limiter: new SearchLimiter(redis!, 1000, "search-bad-test"),
+      limiter: new FixedWindowLimiter(redis!, 1000, "search-bad-test"),
       answers: badProvider,
-      answerLimiter: new SearchLimiter(redis!, 1000, "question-bad-test"),
+      answerLimiter: new FixedWindowLimiter(redis!, 1000, "question-bad-test"),
     });
     const response = await request(badApp)
       .post(`/workspaces/${workspaceId}/questions`)
@@ -812,7 +812,7 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
   });
 
   it("enforces a shared per-workspace search budget in Redis", async () => {
-    const limiter = new SearchLimiter(redis!, 2);
+    const limiter = new FixedWindowLimiter(redis!, 2, "search-test-limit");
     const workspaceId = randomUUID();
     expect(await limiter.take(workspaceId)).toBe(true);
     expect(await limiter.take(workspaceId)).toBe(true);

@@ -11,21 +11,26 @@ import { documentRoutes } from "./documents/routes";
 import { jobRoutes, workspaceJobRoutes } from "./jobs/routes";
 import { aiRoutes } from "./ai/routes";
 import type { EmbeddingProvider } from "./ai/embeddings";
-import { SearchLimiter } from "./ai/search-limiter";
+import type { RateCounter } from "./rate-limit/fixed-window";
 import type { AnswerProvider } from "./ai/answers";
+import { ipRateLimit } from "./rate-limit/middleware";
 
 export function createApp(
   pool: Pool,
-  ai?: {
+  services?: {
     embeddings: EmbeddingProvider;
-    limiter: SearchLimiter;
+    limiter: RateCounter;
     answers?: AnswerProvider;
-    answerLimiter?: SearchLimiter;
+    answerLimiter?: RateCounter;
+    publicLimiter?: RateCounter;
+    authLimiter?: RateCounter;
+    trustProxyHops?: number;
   },
 ) {
   const app = express();
   const logger = pino({ level: process.env.LOG_LEVEL ?? "info" });
   app.disable("x-powered-by");
+  app.set("trust proxy", services?.trustProxyHops ?? 0);
   app.use(helmet());
   app.use(
     pinoHttp({
@@ -53,20 +58,33 @@ export function createApp(
     res.setHeader("x-request-id", String(req.id));
     next();
   });
-  app.use(express.json({ limit: "32kb" }));
   app.get("/health/live", (_req, res) => res.json({ status: "ok" }));
   app.get("/health/ready", async (_req, res) => {
     await pool.query("SELECT 1");
     res.json({ status: "ok" });
   });
+  if (services?.publicLimiter)
+    app.use(ipRateLimit(services.publicLimiter, "api_rate_limited", "allow"));
+  app.use(express.json({ limit: "32kb" }));
+  if (services?.authLimiter)
+    app.use(
+      ["/auth/register", "/auth/login"],
+      ipRateLimit(services.authLimiter, "auth_rate_limited", "reject"),
+    );
   app.use("/auth", authRoutes(pool));
   app.use("/workspaces", workspaceRoutes(pool));
   app.use("/workspaces", documentRoutes(pool));
   app.use("/workspaces", workspaceJobRoutes(pool));
-  if (ai)
+  if (services)
     app.use(
       "/workspaces",
-      aiRoutes(pool, ai.embeddings, ai.limiter, ai.answers, ai.answerLimiter),
+      aiRoutes(
+        pool,
+        services.embeddings,
+        services.limiter,
+        services.answers,
+        services.answerLimiter,
+      ),
     );
   app.use("/jobs", jobRoutes(pool));
   app.use((_req, res) => res.status(404).json({ error: "not_found" }));

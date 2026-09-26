@@ -1,6 +1,6 @@
 # Document research platform
 
-An incremental, multi-tenant document research platform. **Current slice:** authentication, workspaces, private PDF/text uploads with idempotent retries, transactional outbox, workspace backlog control, BullMQ extraction and embedding, pgvector search, grounded answers with citations, job progress, retries, dead-letter records, and approximate token usage. A frontend is a later slice.
+An incremental, multi-tenant document research platform. **Current slice:** authentication, workspaces, private PDF/text uploads with idempotent retries, transactional outbox, workspace backlog control, BullMQ extraction and embedding, pgvector search, grounded answers with citations, API rate limits, job progress, retries, dead-letter records, and approximate token usage. A frontend is a later slice.
 
 ## Local setup
 
@@ -62,6 +62,8 @@ Wait until the job is `completed` before searching. Search allows at most 10 que
 
 Questions have a separate limit of three per workspace per minute. Local Compose returns a matching sentence from retrieved text, or abstains; it does not use an LLM. Set `LLM_PROVIDER=openai` and `OPENAI_API_KEY` on the API for generated answers. The default LLM model is `gpt-4o-mini`; update `LLM_MODEL` and both token price variables together. The example prices reflect the [OpenAI model page](https://developers.openai.com/api/docs/models/gpt-4o-mini) at the time of this phase. Citations are validated against retrieved chunk IDs, but the application cannot automatically prove every claim is supported by the cited text.
 
+The API allows 120 requests per client IP per minute by default (`API_REQUESTS_PER_MINUTE`); registration and login share a limit of 10 (`AUTH_REQUESTS_PER_MINUTE`). Health checks are excluded. General API limits allow requests through if Redis is down, preserving uploads; auth and AI limits return 503 until Redis recovers. Set `TRUST_PROXY_HOPS` only for the actual trusted proxies in front of the API. See ADR 0007 for this availability and security trade-off.
+
 ## Architecture
 
 ```mermaid
@@ -78,7 +80,7 @@ flowchart LR
   API --> LLM[Answer provider]
 ```
 
-PostgreSQL is the authority for identities, memberships, jobs, processed-event records, vectors, and usage. [ADR 0001](docs/adr/0001-workspace-boundary.md) records tenant isolation; [ADR 0002](docs/adr/0002-outbox-processing.md) explains delivery guarantees; [ADR 0003](docs/adr/0003-embeddings-and-search.md) explains vector checkpointing and search; [ADR 0004](docs/adr/0004-grounded-answers.md) explains citation validation and answer cost; [ADR 0005](docs/adr/0005-workspace-admission.md) explains workspace backlog limits; [ADR 0006](docs/adr/0006-upload-idempotency.md) explains upload retry safety. Request, event, and job IDs appear in structured logs.
+PostgreSQL is the authority for identities, memberships, jobs, processed-event records, vectors, and usage. [ADR 0001](docs/adr/0001-workspace-boundary.md) records tenant isolation; [ADR 0002](docs/adr/0002-outbox-processing.md) explains delivery guarantees; [ADR 0003](docs/adr/0003-embeddings-and-search.md) explains vector checkpointing and search; [ADR 0004](docs/adr/0004-grounded-answers.md) explains citation validation and answer cost; [ADR 0005](docs/adr/0005-workspace-admission.md) explains workspace backlog limits; [ADR 0006](docs/adr/0006-upload-idempotency.md) explains upload retry safety; [ADR 0007](docs/adr/0007-api-rate-limits.md) explains edge limits and Redis outages. Request, event, and job IDs appear in structured logs.
 
 ## Verification
 
@@ -104,3 +106,5 @@ For answer behavior, ask about a topic absent from all indexed documents. The lo
 For admission control, set `MAX_PENDING_JOBS_PER_WORKSPACE=1` and restart the API. Stop the worker, then upload two files to the same workspace: the first returns 202 and the second returns 429. Upload to another workspace to see its independent slot. Restart the worker; after the first job completes, the second upload can be retried.
 
 For HTTP retry safety, upload once with a UUID `Idempotency-Key` and repeat the same request with that key. The second response is 200 with the same IDs and no new outbox event. Change the file while keeping the key to see 409. Use a new key for a deliberately separate upload.
+
+For rate limiting, set `API_REQUESTS_PER_MINUTE=2`, restart the API, and call `GET /workspaces` three times without a token: expect 401, 401, then 429 with `Retry-After`. `/health/live` remains available. With an existing bearer token, stop Redis and try an upload: the API can still create the PostgreSQL job and outbox event; registration and AI endpoints return 503 until Redis restarts.

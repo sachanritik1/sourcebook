@@ -4,13 +4,14 @@ import type { Pool } from "pg";
 import { z } from "zod";
 import { requireUser } from "../auth/sessions";
 import { HttpError } from "../http/errors";
+import type { Response } from "express";
 import {
   estimatedCostUsd,
   isProviderRateLimit,
   vectorLiteral,
   type EmbeddingProvider,
 } from "./embeddings";
-import { SearchLimiter } from "./search-limiter";
+import type { RateCounter } from "../rate-limit/fixed-window";
 import { retrieveChunks } from "./retrieval";
 import {
   answerCostUsd,
@@ -27,12 +28,35 @@ const searchBody = z
   })
   .strict();
 
+async function requireWorkspaceBudget(
+  counter: RateCounter,
+  workspaceId: string,
+  res: Response,
+  code: string,
+  message: string,
+): Promise<void> {
+  let allowed;
+  try {
+    allowed = await counter.take(workspaceId);
+  } catch {
+    throw new HttpError(
+      503,
+      "rate_limit_unavailable",
+      "AI endpoints temporarily unavailable",
+    );
+  }
+  if (!allowed) {
+    res.setHeader("Retry-After", "60");
+    throw new HttpError(429, code, message);
+  }
+}
+
 export function aiRoutes(
   pool: Pool,
   embeddings: EmbeddingProvider,
-  limiter: SearchLimiter,
+  limiter: RateCounter,
   answers?: AnswerProvider,
-  answerLimiter?: SearchLimiter,
+  answerLimiter?: RateCounter,
 ): Router {
   const router = Router();
   router.use(requireUser(pool));
@@ -46,14 +70,13 @@ export function aiRoutes(
     );
     if (!membership.rowCount)
       throw new HttpError(404, "workspace_not_found", "Workspace not found");
-    if (!(await limiter.take(workspaceId))) {
-      res.setHeader("Retry-After", "60");
-      throw new HttpError(
-        429,
-        "search_rate_limited",
-        "Search limit reached for this workspace",
-      );
-    }
+    await requireWorkspaceBudget(
+      limiter,
+      workspaceId,
+      res,
+      "search_rate_limited",
+      "Search limit reached for this workspace",
+    );
 
     const started = Date.now();
     let embedding;
@@ -124,14 +147,13 @@ export function aiRoutes(
       );
       if (!membership.rowCount)
         throw new HttpError(404, "workspace_not_found", "Workspace not found");
-      if (!(await answerLimiter.take(workspaceId))) {
-        res.setHeader("Retry-After", "60");
-        throw new HttpError(
-          429,
-          "question_rate_limited",
-          "Question limit reached for this workspace",
-        );
-      }
+      await requireWorkspaceBudget(
+        answerLimiter,
+        workspaceId,
+        res,
+        "question_rate_limited",
+        "Question limit reached for this workspace",
+      );
       let queryEmbedding;
       try {
         queryEmbedding = await embeddings.embed([question]);

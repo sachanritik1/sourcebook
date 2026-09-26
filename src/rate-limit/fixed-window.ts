@@ -1,21 +1,25 @@
 import type IORedis from "ioredis";
 
+export interface RateCounter {
+  take(subject: string): Promise<boolean>;
+}
+
 const TAKE_SCRIPT = `
 local count = redis.call('INCR', KEYS[1])
 if count == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
 return count
 `;
 
-export class SearchLimiter {
+export class FixedWindowLimiter implements RateCounter {
   constructor(
     private readonly redis: IORedis,
-    private readonly limitPerMinute = 10,
-    private readonly keyPrefix = "search-limit",
+    private readonly limitPerMinute: number,
+    private readonly keyPrefix: string,
   ) {}
 
-  async take(workspaceId: string): Promise<boolean> {
+  async take(subject: string): Promise<boolean> {
     const minute = Math.floor(Date.now() / 60_000);
-    const key = `${this.keyPrefix}:${workspaceId}:${minute}`;
+    const key = `${this.keyPrefix}:${subject}:${minute}`;
     const count = await this.redis.eval(TAKE_SCRIPT, 1, key, 120_000);
     return Number(count) <= this.limitPerMinute;
   }
