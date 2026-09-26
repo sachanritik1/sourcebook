@@ -1,6 +1,6 @@
 # Document research platform
 
-An incremental, multi-tenant document research platform. **Current slice:** authentication, workspaces, private PDF/text uploads, transactional outbox, workspace backlog control, BullMQ extraction and embedding, pgvector search, grounded answers with citations, job progress, retries, dead-letter records, and approximate token usage. A frontend is a later slice.
+An incremental, multi-tenant document research platform. **Current slice:** authentication, workspaces, private PDF/text uploads with idempotent retries, transactional outbox, workspace backlog control, BullMQ extraction and embedding, pgvector search, grounded answers with citations, job progress, retries, dead-letter records, and approximate token usage. A frontend is a later slice.
 
 ## Local setup
 
@@ -31,6 +31,7 @@ curl http://localhost:3000/workspaces/<workspace-id> \
 
 curl -X POST http://localhost:3000/workspaces/<workspace-id>/documents \
   -H 'authorization: Bearer <token>' \
+  -H 'Idempotency-Key: <new-uuid-for-this-upload>' \
   -F 'file=@notes.pdf;type=application/pdf'
 # Returns 202: {"documentId":"...","jobId":"...","status":"queued"}
 
@@ -52,6 +53,8 @@ curl http://localhost:3000/workspaces/<workspace-id>/usage \
 ```
 
 `POST /auth/login` accepts the same credentials. `POST /auth/logout` revokes the bearer token. `GET /workspaces` lists only memberships for the caller. A nonmember receives 404 for workspace, document, and job IDs. Files are never served directly. Uploads accept one PDF or UTF-8 text file up to 5 MB per request. `GET /workspaces/:workspaceId/documents` lists document metadata. `GET /workspaces/:workspaceId/jobs?status=failed` lists failed jobs; `POST /jobs/:jobId/retry` retries one. Set `MAX_PROCESSING_ATTEMPTS` from 1 to 10 to change the retry budget for new jobs.
+
+Generate a UUID `Idempotency-Key` for each intended upload. Reuse that key and the same file/filename when retrying after a lost response: the API returns `200` with the original IDs and current status. A reused key with different upload data returns `409`. A new key means a new upload, even for identical bytes.
 
 The API accepts at most 20 queued or processing jobs per workspace by default (`MAX_PENDING_JOBS_PER_WORKSPACE`, 1–100). Upload, reindex, and manual retry return `429 workspace_job_limit` when full. A finished or failed job frees a slot. The worker still handles one active job per workspace; the cap bounds backlog but does not guarantee strict fairness in the shared queue.
 
@@ -75,7 +78,7 @@ flowchart LR
   API --> LLM[Answer provider]
 ```
 
-PostgreSQL is the authority for identities, memberships, jobs, processed-event records, vectors, and usage. [ADR 0001](docs/adr/0001-workspace-boundary.md) records tenant isolation; [ADR 0002](docs/adr/0002-outbox-processing.md) explains delivery guarantees; [ADR 0003](docs/adr/0003-embeddings-and-search.md) explains vector checkpointing and search; [ADR 0004](docs/adr/0004-grounded-answers.md) explains citation validation and answer cost; [ADR 0005](docs/adr/0005-workspace-admission.md) explains workspace backlog limits. Request, event, and job IDs appear in structured logs.
+PostgreSQL is the authority for identities, memberships, jobs, processed-event records, vectors, and usage. [ADR 0001](docs/adr/0001-workspace-boundary.md) records tenant isolation; [ADR 0002](docs/adr/0002-outbox-processing.md) explains delivery guarantees; [ADR 0003](docs/adr/0003-embeddings-and-search.md) explains vector checkpointing and search; [ADR 0004](docs/adr/0004-grounded-answers.md) explains citation validation and answer cost; [ADR 0005](docs/adr/0005-workspace-admission.md) explains workspace backlog limits; [ADR 0006](docs/adr/0006-upload-idempotency.md) explains upload retry safety. Request, event, and job IDs appear in structured logs.
 
 ## Verification
 
@@ -99,3 +102,5 @@ For embedding recovery, interrupt a worker after one batch is saved, restart it,
 For answer behavior, ask about a topic absent from all indexed documents. The local provider should abstain; the OpenAI provider is instructed to abstain when excerpts lack support. Ask as a nonmember and verify a 404 before any provider call. The automated test also injects a citation outside the retrieved set and verifies rejection.
 
 For admission control, set `MAX_PENDING_JOBS_PER_WORKSPACE=1` and restart the API. Stop the worker, then upload two files to the same workspace: the first returns 202 and the second returns 429. Upload to another workspace to see its independent slot. Restart the worker; after the first job completes, the second upload can be retried.
+
+For HTTP retry safety, upload once with a UUID `Idempotency-Key` and repeat the same request with that key. The second response is 200 with the same IDs and no new outbox event. Change the file while keeping the key to see 409. Use a new key for a deliberately separate upload.

@@ -8,15 +8,15 @@ The worker extracts text and commits overlapping chunks, then checkpoints embedd
 
 ## Failure cases
 
-| Failure point                                             | Recovery                                                                                                  |
-| --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| API crashes before commit                                 | No document, job, or event appears.                                                                       |
-| API commits then crashes before response                  | Work proceeds; client may need to list documents. Client upload idempotency keys are a later improvement. |
-| Publisher crashes after enqueue, before marking published | Lease expires; it enqueues the same event ID again. BullMQ suppresses it while retained.                  |
-| Redis loses a published job                               | Reconciler finds the old PostgreSQL job and resets its outbox row for republishing.                       |
-| Worker crashes before committing chunks                   | BullMQ retries; incomplete chunks are rolled back.                                                        |
-| Worker commits then crashes before BullMQ acknowledgement | Replay sees `processed_events` and exits without duplicating chunks.                                      |
-| Processing fails three times                              | PostgreSQL job becomes failed and appears in `dead_letter_jobs`; an authorized member can retry it.       |
+| Failure point                                             | Recovery                                                                                            |
+| --------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| API crashes before commit                                 | No document, job, or event appears.                                                                 |
+| API commits then crashes before response                  | Work proceeds; retry with the same `Idempotency-Key` returns the original IDs (ADR 0006).           |
+| Publisher crashes after enqueue, before marking published | Lease expires; it enqueues the same event ID again. BullMQ suppresses it while retained.            |
+| Redis loses a published job                               | Reconciler finds the old PostgreSQL job and resets its outbox row for republishing.                 |
+| Worker crashes before committing chunks                   | BullMQ retries; incomplete chunks are rolled back.                                                  |
+| Worker commits then crashes before BullMQ acknowledgement | Replay sees `processed_events` and exits without duplicating chunks.                                |
+| Processing fails three times                              | PostgreSQL job becomes failed and appears in `dead_letter_jobs`; an authorized member can retry it. |
 
 ## Trade-offs
 

@@ -123,6 +123,86 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
     }
   }
 
+  it("returns the original IDs for concurrent upload replays, including when full", async () => {
+    const { owner, outsider, workspaceId } = await setup();
+    const capped = appWithPendingLimit(1);
+    const key = randomUUID();
+    const upload = () =>
+      request(capped)
+        .post(`/workspaces/${workspaceId}/documents`)
+        .set("Idempotency-Key", key)
+        .auth(owner.body.token, { type: "bearer" })
+        .attach("file", Buffer.from("Exactly one uploaded document."), {
+          filename: "same.txt",
+          contentType: "text/plain",
+        });
+    const responses = await Promise.all([upload(), upload()]);
+    expect(responses.map((response) => response.status).sort()).toEqual([
+      200, 202,
+    ]);
+    expect(responses[0].body.documentId).toBe(responses[1].body.documentId);
+    expect(responses[0].body.jobId).toBe(responses[1].body.jobId);
+    const counts = await pool!.query(
+      `SELECT (SELECT count(*)::int FROM documents WHERE workspace_id = $1) AS documents,
+              (SELECT count(*)::int FROM processing_jobs WHERE workspace_id = $1) AS jobs,
+              (SELECT count(*)::int FROM outbox_events WHERE workspace_id = $1) AS events`,
+      [workspaceId],
+    );
+    expect(counts.rows[0]).toEqual({ documents: 1, jobs: 1, events: 1 });
+    await request(capped)
+      .post(`/workspaces/${workspaceId}/documents`)
+      .set("Idempotency-Key", key)
+      .auth(owner.body.token, { type: "bearer" })
+      .attach("file", Buffer.from("Different bytes"), {
+        filename: "same.txt",
+        contentType: "text/plain",
+      })
+      .expect(409);
+    await request(capped)
+      .post(`/workspaces/${workspaceId}/documents`)
+      .auth(owner.body.token, { type: "bearer" })
+      .attach("file", Buffer.from("Missing key"), {
+        filename: "missing.txt",
+        contentType: "text/plain",
+      })
+      .expect(400);
+    await request(capped)
+      .post(`/workspaces/${workspaceId}/documents`)
+      .set("Idempotency-Key", key)
+      .auth(outsider.body.token, { type: "bearer" })
+      .attach("file", Buffer.from("Exactly one uploaded document."), {
+        filename: "same.txt",
+        contentType: "text/plain",
+      })
+      .expect(404);
+    const other = await setup();
+    await request(capped)
+      .post(`/workspaces/${other.workspaceId}/documents`)
+      .set("Idempotency-Key", key)
+      .auth(other.owner.body.token, { type: "bearer" })
+      .attach("file", Buffer.from("Different workspace"), {
+        filename: "other.txt",
+        contentType: "text/plain",
+      })
+      .expect(202);
+    const row = await pool!.query(
+      "SELECT payload FROM outbox_events WHERE job_id = $1",
+      [responses[0].body.jobId],
+    );
+    await processDocumentEvent(
+      pool!,
+      row.rows[0].payload as DocumentEvent,
+      1,
+      embeddings,
+    );
+    const finishedReplay = await upload().expect(200);
+    expect(finishedReplay.body).toMatchObject({
+      documentId: responses[0].body.documentId,
+      jobId: responses[0].body.jobId,
+      status: "completed",
+    });
+  });
+
   it("admits only one of two concurrent uploads at the last workspace slot", async () => {
     const { owner, workspaceId } = await setup();
     const capped = appWithPendingLimit(1);
@@ -130,6 +210,7 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
       ["first", "second"].map((name) =>
         request(capped)
           .post(`/workspaces/${workspaceId}/documents`)
+          .set("Idempotency-Key", randomUUID())
           .auth(owner.body.token, { type: "bearer" })
           .attach("file", Buffer.from(`${name} admission evidence`), {
             filename: `${name}.txt`,
@@ -157,6 +238,7 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
     const other = await setup();
     await request(capped)
       .post(`/workspaces/${other.workspaceId}/documents`)
+      .set("Idempotency-Key", randomUUID())
       .auth(other.owner.body.token, { type: "bearer" })
       .attach("file", Buffer.from("other workspace"), {
         filename: "other.txt",
@@ -176,6 +258,7 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
     );
     await request(capped)
       .post(`/workspaces/${workspaceId}/documents`)
+      .set("Idempotency-Key", randomUUID())
       .auth(owner.body.token, { type: "bearer" })
       .attach("file", Buffer.from("capacity released"), {
         filename: "released.txt",
@@ -189,6 +272,7 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
     const capped = appWithPendingLimit(1);
     const upload = await request(capped)
       .post(`/workspaces/${workspaceId}/documents`)
+      .set("Idempotency-Key", randomUUID())
       .auth(owner.body.token, { type: "bearer" })
       .attach("file", Buffer.from("reindex capacity"), {
         filename: "reindex-capacity.txt",
@@ -207,6 +291,7 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
     );
     const queued = await request(capped)
       .post(`/workspaces/${workspaceId}/documents`)
+      .set("Idempotency-Key", randomUUID())
       .auth(owner.body.token, { type: "bearer" })
       .attach("file", Buffer.from("retry capacity"), {
         filename: "retry-capacity.txt",
@@ -232,6 +317,7 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
     );
     await request(capped)
       .post(`/workspaces/${workspaceId}/documents`)
+      .set("Idempotency-Key", randomUUID())
       .auth(owner.body.token, { type: "bearer" })
       .attach("file", Buffer.from("occupy slot"), {
         filename: "occupy.txt",
@@ -253,6 +339,7 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
     const { owner, outsider, workspaceId } = await setup();
     const upload = await request(app!)
       .post(`/workspaces/${workspaceId}/documents`)
+      .set("Idempotency-Key", randomUUID())
       .auth(owner.body.token, { type: "bearer" })
       .attach("file", Buffer.from("Alpha evidence. Beta evidence."), {
         filename: "notes.txt",
@@ -380,6 +467,7 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
     const { owner, workspaceId } = await setup();
     const upload = await request(app!)
       .post(`/workspaces/${workspaceId}/documents`)
+      .set("Idempotency-Key", randomUUID())
       .auth(owner.body.token, { type: "bearer" })
       .attach("file", Buffer.from("%PDF-broken"), {
         filename: "broken.pdf",
@@ -439,6 +527,7 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
     const uploads = await Promise.all([
       request(app!)
         .post(`/workspaces/${first.workspaceId}/documents`)
+        .set("Idempotency-Key", randomUUID())
         .auth(first.owner.body.token, { type: "bearer" })
         .attach("file", Buffer.from("Orchid satellite evidence"), {
           filename: "first.txt",
@@ -447,6 +536,7 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
         .expect(202),
       request(app!)
         .post(`/workspaces/${second.workspaceId}/documents`)
+        .set("Idempotency-Key", randomUUID())
         .auth(second.owner.body.token, { type: "bearer" })
         .attach("file", Buffer.from("Orchid satellite evidence"), {
           filename: "second.txt",
@@ -545,6 +635,7 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
     const { owner, workspaceId } = await setup();
     const upload = await request(app!)
       .post(`/workspaces/${workspaceId}/documents`)
+      .set("Idempotency-Key", randomUUID())
       .auth(owner.body.token, { type: "bearer" })
       .attach("file", Buffer.from("Citation boundary evidence."), {
         filename: "source.txt",
@@ -614,6 +705,7 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
     const { owner, workspaceId } = await setup();
     const upload = await request(app!)
       .post(`/workspaces/${workspaceId}/documents`)
+      .set("Idempotency-Key", randomUUID())
       .auth(owner.body.token, { type: "bearer" })
       .attach("file", Buffer.from("recovery marker ".repeat(2300)), {
         filename: "long.txt",
@@ -671,6 +763,7 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
     const { owner, workspaceId } = await setup();
     const upload = await request(app!)
       .post(`/workspaces/${workspaceId}/documents`)
+      .set("Idempotency-Key", randomUUID())
       .auth(owner.body.token, { type: "bearer" })
       .attach("file", Buffer.from("reindex evidence"), {
         filename: "reindex.txt",

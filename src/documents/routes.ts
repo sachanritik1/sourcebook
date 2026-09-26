@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { basename } from "node:path";
 import { Router } from "express";
 import multer from "multer";
@@ -8,6 +8,7 @@ import { requireUser } from "../auth/sessions";
 import { HttpError } from "../http/errors";
 import { configuredMaxAttempts } from "../processing/types";
 import {
+  acquireWorkspaceAdmission,
   configuredPendingJobLimit,
   requireWorkspaceCapacity,
 } from "../processing/admission";
@@ -56,6 +57,31 @@ function validatedFile(file: Express.Multer.File | undefined): {
   );
 }
 
+function validatedIdempotencyKey(value: string | undefined): string {
+  const parsed = z.uuid().safeParse(value);
+  if (!parsed.success)
+    throw new HttpError(
+      400,
+      "invalid_idempotency_key",
+      "Idempotency-Key must be a UUID",
+    );
+  return parsed.data;
+}
+
+function uploadFingerprint(
+  filename: string,
+  mediaType: string,
+  content: Buffer,
+): string {
+  return createHash("sha256")
+    .update(filename)
+    .update("\0")
+    .update(mediaType)
+    .update("\0")
+    .update(content)
+    .digest("hex");
+}
+
 export function documentRoutes(pool: Pool): Router {
   const router = Router();
   const pendingLimit = configuredPendingJobLimit();
@@ -76,6 +102,7 @@ export function documentRoutes(pool: Pool): Router {
             "workspace_not_found",
             "Workspace not found",
           );
+        validatedIdempotencyKey(req.get("Idempotency-Key"));
         next();
       } catch (error) {
         next(error);
@@ -86,6 +113,10 @@ export function documentRoutes(pool: Pool): Router {
       const workspaceId = z.uuid().parse(req.params.workspaceId);
       const file = req.file;
       const { filename, mediaType } = validatedFile(file);
+      const idempotencyKey = validatedIdempotencyKey(
+        req.get("Idempotency-Key"),
+      );
+      const fingerprint = uploadFingerprint(filename, mediaType, file!.buffer);
       const client = await pool.connect();
       try {
         await client.query("BEGIN");
@@ -99,6 +130,34 @@ export function documentRoutes(pool: Pool): Router {
             "workspace_not_found",
             "Workspace not found",
           );
+        await acquireWorkspaceAdmission(client, workspaceId);
+        const previous = await client.query<{
+          request_fingerprint: string;
+          document_id: string;
+          job_id: string;
+          status: string;
+        }>(
+          `SELECT i.request_fingerprint, i.document_id, i.job_id, j.status
+           FROM upload_idempotency i
+           JOIN processing_jobs j ON j.workspace_id = i.workspace_id AND j.id = i.job_id
+           WHERE i.workspace_id = $1 AND i.idempotency_key = $2`,
+          [workspaceId, idempotencyKey],
+        );
+        if (previous.rows[0]) {
+          if (previous.rows[0].request_fingerprint !== fingerprint)
+            throw new HttpError(
+              409,
+              "idempotency_key_reused",
+              "Idempotency-Key was used for a different upload",
+            );
+          await client.query("COMMIT");
+          res.status(200).json({
+            documentId: previous.rows[0].document_id,
+            jobId: previous.rows[0].job_id,
+            status: previous.rows[0].status,
+          });
+          return;
+        }
         await requireWorkspaceCapacity(client, workspaceId, pendingLimit);
         const documentId = randomUUID();
         const jobId = randomUUID();
@@ -142,6 +201,12 @@ export function documentRoutes(pool: Pool): Router {
               requestId: req.id,
             }),
           ],
+        );
+        await client.query(
+          `INSERT INTO upload_idempotency
+           (workspace_id, idempotency_key, request_fingerprint, document_id, job_id)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [workspaceId, idempotencyKey, fingerprint, documentId, jobId],
         );
         await client.query("COMMIT");
         res.status(202).json({ documentId, jobId, status: "queued" });

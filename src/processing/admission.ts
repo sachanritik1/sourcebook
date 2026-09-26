@@ -19,10 +19,7 @@ export async function requireWorkspaceCapacity(
   workspaceId: string,
   limit: number,
 ): Promise<void> {
-  await client.query(
-    "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 1))",
-    [workspaceId],
-  );
+  await acquireWorkspaceAdmission(client, workspaceId);
   const active = await client.query<{ count: number }>(
     `SELECT count(*)::int AS count FROM processing_jobs
      WHERE workspace_id = $1 AND status IN ('queued', 'processing')`,
@@ -34,4 +31,14 @@ export async function requireWorkspaceCapacity(
       "workspace_job_limit",
       "Workspace has too many queued or processing jobs; retry after a job finishes",
     );
+}
+
+export async function acquireWorkspaceAdmission(
+  client: PoolClient,
+  workspaceId: string,
+): Promise<void> {
+  await client.query(
+    "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 1))",
+    [workspaceId],
+  );
 }
