@@ -1,6 +1,6 @@
 # Document research platform
 
-An incremental, multi-tenant document research platform. **Current slice:** authentication, workspaces, a browser research desk with document uploads and job progress, private PDF/text uploads with idempotent retries, transactional outbox, workspace backlog control, BullMQ extraction and embedding, pgvector search, grounded answers with citations, API and provider rate limits, operational metrics, retries, dead-letter records, and approximate token usage. The browser question screen comes later.
+An incremental, multi-tenant document research platform. **Current slice:** authentication, workspaces, a browser research desk with document uploads, job progress, grounded questions, citations, and usage; private PDF/text uploads with idempotent retries; transactional outbox; workspace backlog control; BullMQ extraction and embedding; pgvector search; API and provider rate limits; operational metrics; retries; and dead-letter records.
 
 ## Local setup
 
@@ -11,7 +11,7 @@ docker compose up --build -d
 curl http://localhost:3000/health/ready
 ```
 
-Open [http://localhost:3001](http://localhost:3001) to create an account and workspace. Open a workspace to upload PDF/text files, watch jobs, and retry failures. The browser app stores the API session in an encrypted HttpOnly cookie. Compose includes a development-only cookie key; set `WEB_SESSION_KEY` to `openssl rand -hex 32` in `.env` before sharing an environment. For local web development, run `npm ci --prefix web && npm run dev --prefix web` with `API_BASE_URL=http://localhost:3000`, `WEB_PUBLIC_ORIGIN=http://localhost:3001`, and `WEB_SESSION_KEY` set.
+Open [http://localhost:3001](http://localhost:3001) to create an account and workspace. Open a workspace to upload PDF/text files, watch jobs, retry failures, ask questions, inspect cited excerpts, and see approximate AI usage. The browser app stores the API session in an encrypted HttpOnly cookie. Compose includes a development-only cookie key; set `WEB_SESSION_KEY` to `openssl rand -hex 32` in `.env` before sharing an environment. For local web development, run `npm ci --prefix web && npm run dev --prefix web` with `API_BASE_URL=http://localhost:3000`, `WEB_PUBLIC_ORIGIN=http://localhost:3001`, and `WEB_SESSION_KEY` set.
 
 For local API development, run `docker compose up -d postgres redis`, copy `.env.example` to `.env`, then `npm ci && npm run migrate && npm run dev`.
 
@@ -48,7 +48,7 @@ curl -X POST http://localhost:3000/workspaces/<workspace-id>/search \
 curl -X POST http://localhost:3000/workspaces/<workspace-id>/questions \
   -H 'authorization: Bearer <token>' -H 'content-type: application/json' \
   -d '{"question":"What does the document say about reliability?","topK":5}'
-# Returns {"answer":"...","citations":[{"chunkId":"...","documentId":"...","filename":"...","ordinal":0}],"model":"..."}
+# Returns {"answer":"...","citations":[{"chunkId":"...","documentId":"...","filename":"...","ordinal":0,"excerpt":"..."}],"model":"..."}
 
 curl http://localhost:3000/workspaces/<workspace-id>/usage \
   -H 'authorization: Bearer <token>'
@@ -89,7 +89,7 @@ flowchart LR
   API --> LLM[Answer provider]
 ```
 
-PostgreSQL is the authority for identities, memberships, jobs, processed-event records, vectors, and usage. [ADR 0001](docs/adr/0001-workspace-boundary.md) records tenant isolation; [ADR 0002](docs/adr/0002-outbox-processing.md) explains delivery guarantees; [ADR 0003](docs/adr/0003-embeddings-and-search.md) explains vector checkpointing and search; [ADR 0004](docs/adr/0004-grounded-answers.md) explains citation validation and answer cost; [ADR 0005](docs/adr/0005-workspace-admission.md) explains workspace backlog limits; [ADR 0006](docs/adr/0006-upload-idempotency.md) explains upload retry safety; [ADR 0007](docs/adr/0007-api-rate-limits.md) explains edge limits and Redis outages; [ADR 0008](docs/adr/0008-operational-metrics.md) explains operational metrics; [ADR 0009](docs/adr/0009-provider-budget.md) explains provider capacity; [ADR 0010](docs/adr/0010-browser-session-boundary.md) explains the browser session boundary; [ADR 0011](docs/adr/0011-browser-upload-and-jobs.md) explains browser upload retries and job polling. Request, event, and job IDs appear in structured logs.
+PostgreSQL is the authority for identities, memberships, jobs, processed-event records, vectors, and usage. [ADR 0001](docs/adr/0001-workspace-boundary.md) records tenant isolation; [ADR 0002](docs/adr/0002-outbox-processing.md) explains delivery guarantees; [ADR 0003](docs/adr/0003-embeddings-and-search.md) explains vector checkpointing and search; [ADR 0004](docs/adr/0004-grounded-answers.md) explains citation validation and answer cost; [ADR 0005](docs/adr/0005-workspace-admission.md) explains workspace backlog limits; [ADR 0006](docs/adr/0006-upload-idempotency.md) explains upload retry safety; [ADR 0007](docs/adr/0007-api-rate-limits.md) explains edge limits and Redis outages; [ADR 0008](docs/adr/0008-operational-metrics.md) explains operational metrics; [ADR 0009](docs/adr/0009-provider-budget.md) explains provider capacity; [ADR 0010](docs/adr/0010-browser-session-boundary.md) explains the browser session boundary; [ADR 0011](docs/adr/0011-browser-upload-and-jobs.md) explains browser upload retries and job polling; [ADR 0012](docs/adr/0012-browser-research.md) explains visible evidence and question failure handling. Request, event, and job IDs appear in structured logs.
 
 ## Verification
 
@@ -97,6 +97,7 @@ PostgreSQL is the authority for identities, memberships, jobs, processed-event r
 npm run typecheck
 npm run lint
 npm run format:check
+npm run test -- tests/unit
 npm run typecheck --prefix web
 npm run test --prefix web
 npm run build --prefix web
@@ -131,3 +132,5 @@ For provider 429 handling, the integration tests inject a temporary 429 with `Re
 For the browser boundary, sign in and create a workspace at port 3001, then refresh: the session and workspace persist. Sign in as a second user in a private window: the first workspace must be absent. Tamper with the `sourcebook_session` cookie in browser dev tools and refresh: access should return 401. A cross-origin POST to `/api/workspaces` should return 403.
 
 For browser upload recovery, select one text file, stop the web container while its request is in flight, then restart it and retry the draft in the same tab if it remains available. The API should return the same IDs when the first attempt committed. If the tab was closed, check the document list before selecting the file again: the browser no longer has the original key. Upload a file containing `%PDF-broken` as a PDF to see a failed job and its Retry action.
+
+For browser research, wait until a document completes and ask a question using a phrase in that document. Confirm the answer lists the exact cited excerpt and that AI usage updates. Ask about an absent topic and check for an abstention without citations. Use a second account to request the first workspace's question or usage route; both return 404. Provider timeouts and lost responses are ambiguous: check usage before manually submitting an expensive question again.

@@ -2,7 +2,7 @@
 
 ## Decision
 
-`POST /workspaces/:workspaceId/questions` embeds the question, retrieves at most ten completed chunks under the caller's workspace membership, and sends numbered excerpts to an answer provider. The provider returns a structured answer, an insufficient-evidence flag, and excerpt numbers. The API maps those numbers to chunk and document IDs from the retrieved set. It rejects missing or out-of-range citations instead of returning an apparently sourced answer. No chunks means an immediate abstention without an LLM call.
+`POST /workspaces/:workspaceId/questions` embeds the question, retrieves at most ten completed chunks under the caller's workspace membership, and sends numbered excerpts to an answer provider. The provider returns a structured answer, an insufficient-evidence flag, and excerpt numbers. The API maps those numbers to chunk and document IDs from the retrieved set and returns the cited chunk text for inspection. It rejects missing or out-of-range citations instead of returning an apparently sourced answer. No chunks means an immediate abstention without an LLM call.
 
 The production adapter uses the OpenAI Responses API directly with a JSON schema and `store: false`. The local adapter extracts a sentence sharing words with the question; it is a development fallback, not an LLM or a semantic answer evaluator. Excerpts are explicitly treated as untrusted data in the system instruction. Validation establishes citation _identity_, but does not prove that the cited text supports every claim. Human review and evaluation examples are still needed before high-stakes use.
 

@@ -46,6 +46,7 @@ export async function backend(
     body?: unknown;
     form?: FormData;
     idempotencyKey?: string;
+    timeoutMs?: number;
   },
 ): Promise<NextResponse> {
   const base = process.env.API_BASE_URL;
@@ -66,7 +67,9 @@ export async function backend(
         options.form ??
         (options.body ? JSON.stringify(options.body) : undefined),
       cache: "no-store",
-      signal: AbortSignal.timeout(options.form ? 30_000 : 10_000),
+      signal: AbortSignal.timeout(
+        options.timeoutMs ?? (options.form ? 30_000 : 10_000),
+      ),
     });
     if (response.status === 204) {
       return new NextResponse(null, {

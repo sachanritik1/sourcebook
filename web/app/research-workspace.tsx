@@ -2,6 +2,7 @@
 
 import { ChangeEvent, useCallback, useEffect, useState } from "react";
 import { MAX_FILE_BYTES } from "@/lib/upload";
+import ResearchAnswers from "./research-answers";
 
 type Workspace = { id: string; name: string; role: string };
 type Document = {
@@ -397,6 +398,13 @@ export default function ResearchWorkspace({
           </p>
         </div>
       </div>
+      <ResearchAnswers
+        workspaceId={workspace.id}
+        hasCompletedDocument={documents.some(
+          (item) => item.status === "completed",
+        )}
+        onUnauthorized={onUnauthorized}
+      />
     </section>
   );
 }

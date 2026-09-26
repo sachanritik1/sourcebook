@@ -50,6 +50,7 @@ export function citedAnswer(draft: AnswerDraft, chunks: RetrievedChunk[]) {
       documentId: chunk.documentId,
       filename: chunk.filename,
       ordinal: chunk.ordinal,
+      excerpt: chunk.content,
     };
   });
   return { answer: parsed.answer, citations };

@@ -131,6 +131,48 @@ assert.equal(
 );
 await waitForJob(workspace.id, owner, firstBody.jobId, "completed");
 
+async function ask(cookie, question) {
+  return request(`/api/workspaces/${workspace.id}/questions`, cookie, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question }),
+  });
+}
+const answered = await ask(owner, "What does the source note say?");
+if (answered.status !== 200)
+  throw new Error(`question: ${answered.status} ${await answered.text()}`);
+const grounded = await answered.json();
+assert.match(grounded.answer, /source note/i);
+assert.equal(grounded.citations.length, 1);
+assert.equal(grounded.citations[0].filename, "source.txt");
+assert.match(grounded.citations[0].excerpt, /source note/i);
+const absent = await ask(owner, "What about xylophone archaeology?");
+assert.equal(absent.status, 200);
+assert.deepEqual((await absent.json()).citations, []);
+assert.equal((await ask(other, "What does the source note say?")).status, 404);
+const usage = await request(`/api/workspaces/${workspace.id}/usage`, owner);
+assert.equal(usage.status, 200);
+assert.ok(
+  (await usage.json()).usage.some((row) => row.operation === "llm_answer"),
+);
+assert.equal(
+  (await request(`/api/workspaces/${workspace.id}/usage`, other)).status,
+  404,
+);
+const crossOriginQuestion = await fetch(
+  `${origin}/api/workspaces/${workspace.id}/questions`,
+  {
+    method: "POST",
+    headers: {
+      Cookie: owner,
+      Origin: "https://other.example",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ question: "What does the source note say?" }),
+  },
+);
+assert.equal(crossOriginQuestion.status, 403);
+
 const failedUpload = await upload(
   workspace.id,
   owner,
@@ -162,5 +204,5 @@ const wrongOrigin = await fetch(
 assert.equal(wrongOrigin.status, 403);
 
 console.log(
-  "PASS upload replay, tenant isolation, job progress, failed-job retry, origin check",
+  "PASS upload replay, tenant isolation, grounded answer, usage, job retry, origin check",
 );

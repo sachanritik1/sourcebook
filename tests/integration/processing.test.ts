@@ -598,6 +598,7 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
         documentId: uploads[0].body.documentId,
         filename: "first.txt",
         ordinal: 0,
+        excerpt: "Orchid satellite evidence",
       },
     ]);
     await request(app!)
