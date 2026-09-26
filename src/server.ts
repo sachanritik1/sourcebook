@@ -11,6 +11,7 @@ import {
   configuredTrustProxyHops,
 } from "./rate-limit/middleware";
 import { QUEUE_NAME } from "./processing/types";
+import { limitAnswers, limitEmbeddings } from "./ai/provider-budget";
 
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) throw new Error("DATABASE_URL is required");
@@ -22,8 +23,30 @@ const redis = new IORedis(redisUrl, {
   maxRetriesPerRequest: 1,
   enableOfflineQueue: false,
 });
-const embeddings = createEmbeddingProvider();
-const answers = createAnswerProvider();
+const baseEmbeddings = createEmbeddingProvider();
+const baseAnswers = createAnswerProvider();
+const embeddings =
+  process.env.EMBEDDING_PROVIDER === "openai"
+    ? limitEmbeddings(
+        baseEmbeddings,
+        new FixedWindowLimiter(
+          redis,
+          configuredRateLimit("EMBEDDING_REQUESTS_PER_MINUTE", 60),
+          `provider-embedding:${baseEmbeddings.model}`,
+        ),
+      )
+    : baseEmbeddings;
+const answers =
+  process.env.LLM_PROVIDER === "openai"
+    ? limitAnswers(
+        baseAnswers,
+        new FixedWindowLimiter(
+          redis,
+          configuredRateLimit("ANSWER_REQUESTS_PER_MINUTE", 30),
+          `provider-answer:${baseAnswers.model}`,
+        ),
+      )
+    : baseAnswers;
 const metricsToken = process.env.METRICS_TOKEN;
 const metricsQueue = metricsToken
   ? new Queue(QUEUE_NAME, { connection: redis })

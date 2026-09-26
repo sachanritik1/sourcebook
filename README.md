@@ -1,6 +1,6 @@
 # Document research platform
 
-An incremental, multi-tenant document research platform. **Current slice:** authentication, workspaces, private PDF/text uploads with idempotent retries, transactional outbox, workspace backlog control, BullMQ extraction and embedding, pgvector search, grounded answers with citations, API rate limits, operational metrics, job progress, retries, dead-letter records, and approximate token usage. A frontend is a later slice.
+An incremental, multi-tenant document research platform. **Current slice:** authentication, workspaces, private PDF/text uploads with idempotent retries, transactional outbox, workspace backlog control, BullMQ extraction and embedding, pgvector search, grounded answers with citations, API and provider rate limits, operational metrics, job progress, retries, dead-letter records, and approximate token usage. A frontend is a later slice.
 
 ## Local setup
 
@@ -64,6 +64,8 @@ Questions have a separate limit of three per workspace per minute. Local Compose
 
 The API allows 120 requests per client IP per minute by default (`API_REQUESTS_PER_MINUTE`); registration and login share a limit of 10 (`AUTH_REQUESTS_PER_MINUTE`). Health checks are excluded. General API limits allow requests through if Redis is down, preserving uploads; auth and AI limits return 503 until Redis recovers. Set `TRUST_PROXY_HOPS` only for the actual trusted proxies in front of the API. See ADR 0007 for this availability and security trade-off.
 
+When using OpenAI, the API and worker share an embedding request budget of 60 calls per minute by default (`EMBEDDING_REQUESTS_PER_MINUTE`). Answer calls have a separate 30-per-minute budget (`ANSWER_REQUESTS_PER_MINUTE`). Set these below your provider account's limits. A full budget returns 503 with `Retry-After` on synchronous AI routes and delays worker jobs without consuming a processing failure attempt. The local adapters do not use these budgets. These counters limit requests, not tokens; provider limits can still be lower. See ADR 0009.
+
 Set `METRICS_TOKEN` to a random secret of at least 32 characters to enable `GET /internal/metrics`. Send `Authorization: Bearer <metrics-token>`. The global snapshot includes BullMQ queue depth, pending outbox events, job status and end-to-end time, retry attempts for current job events, answer latency, and token totals. Keep this endpoint behind a private network in deployment. See ADR 0008 for metric definitions and limits.
 
 ## Architecture
@@ -82,7 +84,7 @@ flowchart LR
   API --> LLM[Answer provider]
 ```
 
-PostgreSQL is the authority for identities, memberships, jobs, processed-event records, vectors, and usage. [ADR 0001](docs/adr/0001-workspace-boundary.md) records tenant isolation; [ADR 0002](docs/adr/0002-outbox-processing.md) explains delivery guarantees; [ADR 0003](docs/adr/0003-embeddings-and-search.md) explains vector checkpointing and search; [ADR 0004](docs/adr/0004-grounded-answers.md) explains citation validation and answer cost; [ADR 0005](docs/adr/0005-workspace-admission.md) explains workspace backlog limits; [ADR 0006](docs/adr/0006-upload-idempotency.md) explains upload retry safety; [ADR 0007](docs/adr/0007-api-rate-limits.md) explains edge limits and Redis outages; [ADR 0008](docs/adr/0008-operational-metrics.md) explains operational metrics. Request, event, and job IDs appear in structured logs.
+PostgreSQL is the authority for identities, memberships, jobs, processed-event records, vectors, and usage. [ADR 0001](docs/adr/0001-workspace-boundary.md) records tenant isolation; [ADR 0002](docs/adr/0002-outbox-processing.md) explains delivery guarantees; [ADR 0003](docs/adr/0003-embeddings-and-search.md) explains vector checkpointing and search; [ADR 0004](docs/adr/0004-grounded-answers.md) explains citation validation and answer cost; [ADR 0005](docs/adr/0005-workspace-admission.md) explains workspace backlog limits; [ADR 0006](docs/adr/0006-upload-idempotency.md) explains upload retry safety; [ADR 0007](docs/adr/0007-api-rate-limits.md) explains edge limits and Redis outages; [ADR 0008](docs/adr/0008-operational-metrics.md) explains operational metrics; [ADR 0009](docs/adr/0009-provider-budget.md) explains provider capacity. Request, event, and job IDs appear in structured logs.
 
 ## Verification
 
@@ -112,3 +114,5 @@ For HTTP retry safety, upload once with a UUID `Idempotency-Key` and repeat the 
 For rate limiting, set `API_REQUESTS_PER_MINUTE=2`, restart the API, and call `GET /workspaces` three times without a token: expect 401, 401, then 429 with `Retry-After`. `/health/live` remains available. With an existing bearer token, stop Redis and try an upload: the API can still create the PostgreSQL job and outbox event; registration and AI endpoints return 503 until Redis restarts.
 
 For metrics, set `METRICS_TOKEN` and restart the API. Upload and process a document, then call `GET /internal/metrics` with the token. Without the token, expect 401. Stop Redis and repeat with the token: the snapshot fails because queue depth cannot be read; `/health/ready` still checks PostgreSQL only.
+
+For provider capacity, use a non-production provider key and set `EMBEDDING_REQUESTS_PER_MINUTE=1` on both API and worker. Upload two documents in one minute: the first embedding call uses the shared slot, while the second job waits until the next minute. A search in that minute returns 503 with `Retry-After`. Check that the waiting job has no dead-letter record and completes after the window resets. The automated test exercises the same behavior without an external API key.

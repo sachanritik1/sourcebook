@@ -1,17 +1,82 @@
 import "dotenv/config";
-import { DelayedError, Worker } from "bullmq";
+import { DelayedError, Worker, type Job } from "bullmq";
 import IORedis from "ioredis";
 import pino from "pino";
-import { createEmbeddingProvider } from "../ai/embeddings";
+import type { Pool } from "pg";
+import {
+  createEmbeddingProvider,
+  type EmbeddingProvider,
+} from "../ai/embeddings";
+import { limitEmbeddings, ProviderBudgetError } from "../ai/provider-budget";
 import { createPool } from "../db/pool";
+import { FixedWindowLimiter } from "../rate-limit/fixed-window";
+import { configuredRateLimit } from "../rate-limit/middleware";
 import {
   processDocumentEvent,
   recordFailure,
   WorkspaceBusyError,
 } from "./processor";
-import { documentEventSchema, QUEUE_NAME } from "./types";
+import { documentEventSchema, QUEUE_NAME, type DocumentEvent } from "./types";
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? "info" });
+
+export async function processQueuedDocument(
+  pool: Pool,
+  job: Job<DocumentEvent>,
+  token: string | undefined,
+  embeddings: EmbeddingProvider,
+): Promise<void> {
+  const event = documentEventSchema.parse(job.data);
+  const attempt = job.attemptsMade + 1;
+  try {
+    await processDocumentEvent(pool, event, attempt, embeddings);
+    logger.info(
+      {
+        eventId: event.eventId,
+        jobId: event.jobId,
+        workspaceId: event.workspaceId,
+        requestId: event.requestId,
+        attempt,
+      },
+      "document processed",
+    );
+  } catch (error) {
+    if (
+      error instanceof WorkspaceBusyError ||
+      error instanceof ProviderBudgetError
+    ) {
+      const delay =
+        error instanceof ProviderBudgetError ? error.retryAfterMs : 1000;
+      await job.moveToDelayed(Date.now() + delay, token);
+      logger.warn(
+        {
+          eventId: event.eventId,
+          jobId: event.jobId,
+          workspaceId: event.workspaceId,
+          requestId: event.requestId,
+          attempt,
+          delayMs: delay,
+          reason: error.message,
+        },
+        "document processing deferred",
+      );
+      throw new DelayedError();
+    }
+    await recordFailure(pool, event, attempt, job.opts.attempts ?? 1, error);
+    logger.error(
+      {
+        err: error,
+        eventId: event.eventId,
+        jobId: event.jobId,
+        workspaceId: event.workspaceId,
+        requestId: event.requestId,
+        attempt,
+      },
+      "document processing failed",
+    );
+    throw error;
+  }
+}
 
 async function main() {
   const databaseUrl = process.env.DATABASE_URL;
@@ -19,51 +84,28 @@ async function main() {
   if (!databaseUrl || !redisUrl)
     throw new Error("DATABASE_URL and REDIS_URL are required");
   const pool = createPool(databaseUrl);
-  const embeddings = createEmbeddingProvider();
+  const baseEmbeddings = createEmbeddingProvider();
+  const budgetConnection =
+    process.env.EMBEDDING_PROVIDER === "openai"
+      ? new IORedis(redisUrl, {
+          maxRetriesPerRequest: 1,
+          enableOfflineQueue: false,
+        })
+      : null;
+  const embeddings = budgetConnection
+    ? limitEmbeddings(
+        baseEmbeddings,
+        new FixedWindowLimiter(
+          budgetConnection,
+          configuredRateLimit("EMBEDDING_REQUESTS_PER_MINUTE", 60),
+          `provider-embedding:${baseEmbeddings.model}`,
+        ),
+      )
+    : baseEmbeddings;
   const connection = new IORedis(redisUrl, { maxRetriesPerRequest: null });
   const worker = new Worker(
     QUEUE_NAME,
-    async (job, token) => {
-      const event = documentEventSchema.parse(job.data);
-      const attempt = job.attemptsMade + 1;
-      try {
-        await processDocumentEvent(pool, event, attempt, embeddings);
-        logger.info(
-          {
-            eventId: event.eventId,
-            jobId: event.jobId,
-            workspaceId: event.workspaceId,
-            requestId: event.requestId,
-            attempt,
-          },
-          "document processed",
-        );
-      } catch (error) {
-        if (error instanceof WorkspaceBusyError) {
-          await job.moveToDelayed(Date.now() + 1000, token);
-          throw new DelayedError();
-        }
-        await recordFailure(
-          pool,
-          event,
-          attempt,
-          job.opts.attempts ?? 1,
-          error,
-        );
-        logger.error(
-          {
-            err: error,
-            eventId: event.eventId,
-            jobId: event.jobId,
-            workspaceId: event.workspaceId,
-            requestId: event.requestId,
-            attempt,
-          },
-          "document processing failed",
-        );
-        throw error;
-      }
-    },
+    (job, token) => processQueuedDocument(pool, job, token, embeddings),
     { connection, concurrency: 4, maxStalledCount: 2 },
   );
   worker.on("error", (error) => logger.error({ err: error }, "worker error"));
@@ -73,6 +115,7 @@ async function main() {
   const shutdown = async () => {
     await worker.close();
     await connection.quit();
+    await budgetConnection?.quit();
     await pool.end();
   };
   process.on("SIGTERM", () => void shutdown());

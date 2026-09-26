@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
-import { Queue } from "bullmq";
+import { DelayedError, Queue, type Job } from "bullmq";
 import IORedis from "ioredis";
 import request from "supertest";
 import { createApp } from "../../src/app";
@@ -9,6 +9,7 @@ import {
   type EmbeddingProvider,
 } from "../../src/ai/embeddings";
 import { FixedWindowLimiter } from "../../src/rate-limit/fixed-window";
+import { limitEmbeddings } from "../../src/ai/provider-budget";
 import {
   citedAnswer,
   InvalidCitationError,
@@ -25,6 +26,7 @@ import {
 } from "../../src/processing/processor";
 import { publishPending, reconcileJobs } from "../../src/processing/publisher";
 import type { DocumentEvent } from "../../src/processing/types";
+import { processQueuedDocument } from "../../src/processing/worker";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const redisUrl = process.env.TEST_REDIS_URL;
@@ -818,6 +820,57 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
     expect(await limiter.take(workspaceId)).toBe(true);
     expect(await limiter.take(workspaceId)).toBe(false);
     expect(await limiter.take(randomUUID())).toBe(true);
+  });
+
+  it("defers a worker when provider capacity is full without recording a failed attempt", async () => {
+    const { owner, workspaceId } = await setup();
+    const upload = await request(app!)
+      .post(`/workspaces/${workspaceId}/documents`)
+      .set("Idempotency-Key", randomUUID())
+      .auth(owner.body.token, { type: "bearer" })
+      .attach("file", Buffer.from("Provider capacity checkpoint."), {
+        filename: "capacity.txt",
+        contentType: "text/plain",
+      })
+      .expect(202);
+    const row = await pool!.query(
+      "SELECT payload FROM outbox_events WHERE job_id = $1",
+      [upload.body.jobId],
+    );
+    const event = row.rows[0].payload as DocumentEvent;
+    let delayedUntil = 0;
+    const job = {
+      data: event,
+      attemptsMade: 0,
+      opts: { attempts: 3 },
+      moveToDelayed: async (until: number) => {
+        delayedUntil = until;
+      },
+    } as unknown as Job<DocumentEvent>;
+    const limited = limitEmbeddings(embeddings, {
+      take: async () => false,
+    });
+    await expect(
+      processQueuedDocument(pool!, job, "test-lock", limited),
+    ).rejects.toBeInstanceOf(DelayedError);
+    expect(delayedUntil).toBeGreaterThan(Date.now());
+    const current = await pool!.query(
+      `SELECT status, attempts_made AS attempts,
+       (SELECT count(*)::int FROM dead_letter_jobs WHERE job_id = $1) AS dead_letters
+       FROM processing_jobs WHERE id = $1`,
+      [upload.body.jobId],
+    );
+    expect(current.rows[0]).toEqual({
+      status: "processing",
+      attempts: 1,
+      dead_letters: 0,
+    });
+    await processQueuedDocument(pool!, job, "test-lock", embeddings);
+    const completed = await pool!.query(
+      "SELECT status FROM processing_jobs WHERE id = $1",
+      [upload.body.jobId],
+    );
+    expect(completed.rows[0].status).toBe("completed");
   });
 
   it("protects operational metrics and reports persisted work and usage", async () => {

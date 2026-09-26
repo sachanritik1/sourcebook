@@ -5,6 +5,7 @@ import request from "supertest";
 import { createApp } from "../../src/app";
 import { LocalLexicalEmbeddings } from "../../src/ai/embeddings";
 import { LocalExtractiveAnswers } from "../../src/ai/answers";
+import { limitEmbeddings } from "../../src/ai/provider-budget";
 import { migrate } from "../../src/db/migrate";
 import { createPool } from "../../src/db/pool";
 import {
@@ -150,5 +151,44 @@ describe.skipIf(!databaseUrl || !redisUrl)("API rate limits", () => {
       .send({ question: "What evidence?" })
       .expect(503);
     expect(question.body.error).toBe("rate_limit_unavailable");
+  });
+
+  it("returns Retry-After before calling a provider when shared capacity is full", async () => {
+    let providerCalls = 0;
+    const limited = limitEmbeddings(
+      {
+        model: embeddings.model,
+        usdPerMillionTokens: 0,
+        embed: async (inputs: string[]) => {
+          providerCalls++;
+          return embeddings.embed(inputs);
+        },
+      },
+      { take: async () => false },
+    );
+    const app = createApp(pool!, {
+      embeddings: limited,
+      limiter: searchLimiter!,
+    });
+    const owner = await request(app)
+      .post("/auth/register")
+      .send({
+        email: `capacity-${randomUUID()}@example.com`,
+        password: "a-long-test-password",
+      })
+      .expect(201);
+    const workspace = await request(app)
+      .post("/workspaces")
+      .auth(owner.body.token, { type: "bearer" })
+      .send({ name: "Provider capacity test" })
+      .expect(201);
+    const response = await request(app)
+      .post(`/workspaces/${workspace.body.id}/search`)
+      .auth(owner.body.token, { type: "bearer" })
+      .send({ query: "capacity" })
+      .expect(503);
+    expect(response.body.error).toBe("provider_budget_exhausted");
+    expect(Number(response.headers["retry-after"])).toBeGreaterThan(0);
+    expect(providerCalls).toBe(0);
   });
 });

@@ -8,6 +8,7 @@ import type { Response } from "express";
 import {
   estimatedCostUsd,
   isProviderRateLimit,
+  providerRetryAfterSeconds,
   vectorLiteral,
   type EmbeddingProvider,
 } from "./embeddings";
@@ -20,6 +21,30 @@ import {
   InvalidCitationError,
   type AnswerProvider,
 } from "./answers";
+import { ProviderBudgetError } from "./provider-budget";
+
+function rethrowProviderError(
+  error: unknown,
+  res: Response,
+  code: string,
+  message: string,
+): never {
+  if (error instanceof ProviderBudgetError) {
+    res.setHeader("Retry-After", String(Math.ceil(error.retryAfterMs / 1000)));
+    throw new HttpError(
+      503,
+      error.reason === "exhausted"
+        ? "provider_budget_exhausted"
+        : "provider_budget_unavailable",
+      "Provider request capacity temporarily unavailable",
+    );
+  }
+  if (isProviderRateLimit(error)) {
+    res.setHeader("Retry-After", String(providerRetryAfterSeconds(error)));
+    throw new HttpError(503, code, message);
+  }
+  throw error;
+}
 
 const searchBody = z
   .object({
@@ -83,15 +108,12 @@ export function aiRoutes(
     try {
       embedding = await embeddings.embed([query]);
     } catch (error) {
-      if (isProviderRateLimit(error)) {
-        res.setHeader("Retry-After", "30");
-        throw new HttpError(
-          503,
-          "embedding_provider_busy",
-          "Embedding provider is rate limited",
-        );
-      }
-      throw error;
+      rethrowProviderError(
+        error,
+        res,
+        "embedding_provider_busy",
+        "Embedding provider is rate limited",
+      );
     }
     if (
       embedding.vectors.length !== 1 ||
@@ -158,15 +180,12 @@ export function aiRoutes(
       try {
         queryEmbedding = await embeddings.embed([question]);
       } catch (error) {
-        if (isProviderRateLimit(error)) {
-          res.setHeader("Retry-After", "30");
-          throw new HttpError(
-            503,
-            "embedding_provider_busy",
-            "Embedding provider is rate limited",
-          );
-        }
-        throw error;
+        rethrowProviderError(
+          error,
+          res,
+          "embedding_provider_busy",
+          "Embedding provider is rate limited",
+        );
       }
       if (
         queryEmbedding.vectors.length !== 1 ||
@@ -213,15 +232,12 @@ export function aiRoutes(
       try {
         draft = await answers.answer(question, chunks);
       } catch (error) {
-        if (isProviderRateLimit(error)) {
-          res.setHeader("Retry-After", "30");
-          throw new HttpError(
-            503,
-            "llm_provider_busy",
-            "Answer provider is rate limited",
-          );
-        }
-        throw error;
+        rethrowProviderError(
+          error,
+          res,
+          "llm_provider_busy",
+          "Answer provider is rate limited",
+        );
       }
       const llmLatencyMs = Date.now() - llmStarted;
       await pool.query(

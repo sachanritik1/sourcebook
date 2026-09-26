@@ -106,3 +106,18 @@ export function createEmbeddingProvider(): EmbeddingProvider {
 export function isProviderRateLimit(error: unknown): boolean {
   return error instanceof Error && "status" in error && error.status === 429;
 }
+
+export function providerRetryAfterSeconds(error: unknown): number {
+  const headers =
+    error instanceof Error && "headers" in error ? error.headers : undefined;
+  const raw = headers instanceof Headers ? headers.get("retry-after") : null;
+  if (raw) {
+    const seconds = Number(raw);
+    if (Number.isFinite(seconds) && seconds >= 0)
+      return Math.max(1, Math.ceil(seconds));
+    const date = Date.parse(raw);
+    if (Number.isFinite(date))
+      return Math.max(1, Math.ceil((date - Date.now()) / 1000));
+  }
+  return 30;
+}
