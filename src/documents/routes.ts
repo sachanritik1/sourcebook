@@ -165,6 +165,65 @@ export function documentRoutes(pool: Pool): Router {
     res.json({ documents: result.rows });
   });
 
+  router.post(
+    "/:workspaceId/documents/:documentId/reindex",
+    async (req, res) => {
+      const workspaceId = z.uuid().parse(req.params.workspaceId);
+      const documentId = z.uuid().parse(req.params.documentId);
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const document = await client.query<{ status: string }>(
+          `SELECT d.status FROM documents d
+         JOIN workspace_memberships m ON m.workspace_id = d.workspace_id
+         WHERE d.workspace_id = $1 AND d.id = $2 AND m.user_id = $3 FOR UPDATE OF d`,
+          [workspaceId, documentId, res.locals.userId],
+        );
+        if (!document.rows[0])
+          throw new HttpError(404, "document_not_found", "Document not found");
+        if (document.rows[0].status !== "completed")
+          throw new HttpError(
+            409,
+            "document_not_completed",
+            "Only completed documents can be reindexed",
+          );
+        const jobId = randomUUID();
+        const eventId = randomUUID();
+        await client.query(
+          "UPDATE documents SET status = 'queued', updated_at = now() WHERE workspace_id = $1 AND id = $2",
+          [workspaceId, documentId],
+        );
+        await client.query(
+          `INSERT INTO processing_jobs (id, workspace_id, document_id, current_event_id, status, stage, progress, max_attempts)
+         VALUES ($1, $2, $3, $4, 'queued', 'waiting_for_publisher', 0, $5)`,
+          [jobId, workspaceId, documentId, eventId, configuredMaxAttempts()],
+        );
+        await client.query(
+          "INSERT INTO outbox_events (id, workspace_id, job_id, event_type, payload) VALUES ($1, $2, $3, 'document.process', $4)",
+          [
+            eventId,
+            workspaceId,
+            jobId,
+            JSON.stringify({
+              eventId,
+              workspaceId,
+              documentId,
+              jobId,
+              requestId: req.id,
+            }),
+          ],
+        );
+        await client.query("COMMIT");
+        res.status(202).json({ documentId, jobId, status: "queued" });
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
+  );
+
   router.get("/:workspaceId/documents/:documentId", async (req, res) => {
     const workspaceId = z.uuid().parse(req.params.workspaceId);
     const documentId = z.uuid().parse(req.params.documentId);

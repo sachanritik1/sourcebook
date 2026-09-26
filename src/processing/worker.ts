@@ -2,6 +2,7 @@ import "dotenv/config";
 import { DelayedError, Worker } from "bullmq";
 import IORedis from "ioredis";
 import pino from "pino";
+import { createEmbeddingProvider } from "../ai/embeddings";
 import { createPool } from "../db/pool";
 import {
   processDocumentEvent,
@@ -18,6 +19,7 @@ async function main() {
   if (!databaseUrl || !redisUrl)
     throw new Error("DATABASE_URL and REDIS_URL are required");
   const pool = createPool(databaseUrl);
+  const embeddings = createEmbeddingProvider();
   const connection = new IORedis(redisUrl, { maxRetriesPerRequest: null });
   const worker = new Worker(
     QUEUE_NAME,
@@ -25,7 +27,7 @@ async function main() {
       const event = documentEventSchema.parse(job.data);
       const attempt = job.attemptsMade + 1;
       try {
-        await processDocumentEvent(pool, event, attempt);
+        await processDocumentEvent(pool, event, attempt, embeddings);
         logger.info(
           {
             eventId: event.eventId,

@@ -4,7 +4,7 @@
 
 An upload stores a private file (maximum 5 MB), a document row, a processing job, and an outbox event in one PostgreSQL transaction. The API returns `202` with the document and job IDs. A separate publisher leases outbox rows with `FOR UPDATE SKIP LOCKED`, adds BullMQ jobs with the outbox event ID as `jobId`, and marks rows published. The publisher periodically checks old queued or processing jobs and republishes events missing from Redis.
 
-The worker extracts text, makes simple overlapping chunks, and commits the chunks, completed job status, and a `processed_events` row together. A PostgreSQL advisory lock allows one active document per workspace across worker processes. BullMQ runs four concurrent jobs per worker and retries processing failures three times with exponential backoff. A permanently failed job enters a PostgreSQL dead-letter table; manual retry creates a new outbox event ID for the same logical job.
+The worker extracts text and commits overlapping chunks, then checkpoints embedding batches. It commits completed job status and a `processed_events` row after all vectors are present. A PostgreSQL advisory lock allows one active document per workspace across worker processes. BullMQ runs four concurrent jobs per worker and retries processing failures three times with exponential backoff. A permanently failed job enters a PostgreSQL dead-letter table; manual retry creates a new outbox event ID for the same logical job.
 
 ## Failure cases
 
@@ -20,6 +20,6 @@ The worker extracts text, makes simple overlapping chunks, and commits the chunk
 
 ## Trade-offs
 
-This is at-least-once delivery with idempotent database effects, not exactly-once execution. BullMQ job IDs are a short-lived duplicate guard because jobs can be removed. PostgreSQL is the durable guard. A provider call introduced later may be repeated if the worker crashes after the call and before storing its result; that boundary will need provider idempotency or reconciliation.
+This is at-least-once delivery with idempotent database effects, not exactly-once execution. BullMQ job IDs are a short-lived duplicate guard because jobs can be removed. PostgreSQL is the durable guard. An embedding provider call may be repeated if the worker crashes after the call and before storing its result; ADR 0003 records that cost-tracking limit.
 
-Small files live in PostgreSQL to make this first transaction simple and private. Larger files should move to private S3 storage with a staged-upload state and cleanup process. PDF parsing is restricted by input and extracted-text size, but it is not yet isolated with CPU and memory limits; that is required before accepting untrusted large-scale traffic. The advisory lock limits one active job per workspace; a large tenant may still affect queue latency because BullMQ dispatches a shared queue. Fair scheduling can be added if observed latency requires it.
+Small files live in PostgreSQL to make this first transaction simple and private. Larger files should move to private S3 storage with a staged-upload state and cleanup process. PDF parsing is restricted by input and extracted-text size, but it is not yet isolated with CPU and memory limits; that is required before accepting untrusted large-scale traffic. The advisory lock limits one active job per workspace; a large tenant may still affect queue latency because BullMQ dispatches a shared queue. Fair scheduling can be added if observed latency requires it. See ADR 0003 for embedding checkpoints and provider-call failures.

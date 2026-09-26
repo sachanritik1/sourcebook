@@ -41,6 +41,10 @@ services:
     build: .
     environment:
       DATABASE_URL: postgres://app:app@postgres:5432/research
+      REDIS_URL: redis://redis:6379
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      EMBEDDING_USD_PER_MILLION_TOKENS: ${EMBEDDING_USD_PER_MILLION_TOKENS:-0.02}
       PORT: 3000
       LOG_LEVEL: info
       MAX_PROCESSING_ATTEMPTS: ${MAX_PROCESSING_ATTEMPTS:-3}
@@ -49,6 +53,8 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      redis:
+        condition: service_healthy
     healthcheck:
       test:
         [
@@ -80,6 +86,9 @@ services:
     environment:
       DATABASE_URL: postgres://app:app@postgres:5432/research
       REDIS_URL: redis://redis:6379
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      EMBEDDING_USD_PER_MILLION_TOKENS: ${EMBEDDING_USD_PER_MILLION_TOKENS:-0.02}
       LOG_LEVEL: info
     depends_on:
       migrate:
