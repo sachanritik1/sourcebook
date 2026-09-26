@@ -78,6 +78,30 @@ services:
       timeout: 3s
       retries: 10
 
+  web:
+    build: ./web
+    environment:
+      API_BASE_URL: http://api:3000
+      WEB_PUBLIC_ORIGIN: ${WEB_PUBLIC_ORIGIN:-http://localhost:3001}
+      # Development-only default; set a random key outside local Compose.
+      WEB_SESSION_KEY: ${WEB_SESSION_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+    ports:
+      - "127.0.0.1:3001:3001"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://localhost:3001').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
   publisher:
     build: .
     command: ["node", "dist/processing/publisher.js"]

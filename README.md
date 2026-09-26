@@ -1,6 +1,6 @@
 # Document research platform
 
-An incremental, multi-tenant document research platform. **Current slice:** authentication, workspaces, private PDF/text uploads with idempotent retries, transactional outbox, workspace backlog control, BullMQ extraction and embedding, pgvector search, grounded answers with citations, API and provider rate limits, operational metrics, job progress, retries, dead-letter records, and approximate token usage. A frontend is a later slice.
+An incremental, multi-tenant document research platform. **Current slice:** authentication, workspaces, a browser research desk, private PDF/text uploads with idempotent retries, transactional outbox, workspace backlog control, BullMQ extraction and embedding, pgvector search, grounded answers with citations, API and provider rate limits, operational metrics, job progress, retries, dead-letter records, and approximate token usage. The browser currently covers sign-in and workspaces; document and question screens come later.
 
 ## Local setup
 
@@ -10,6 +10,8 @@ Requirements: Docker Compose and Node.js 22 or newer.
 docker compose up --build -d
 curl http://localhost:3000/health/ready
 ```
+
+Open [http://localhost:3001](http://localhost:3001) to create an account and workspace. The browser app stores the API session in an encrypted HttpOnly cookie. Compose includes a development-only cookie key; set `WEB_SESSION_KEY` to `openssl rand -hex 32` in `.env` before sharing an environment. For local web development, run `npm ci --prefix web && npm run dev --prefix web` with `API_BASE_URL=http://localhost:3000`, `WEB_PUBLIC_ORIGIN=http://localhost:3001`, and `WEB_SESSION_KEY` set.
 
 For local API development, run `docker compose up -d postgres redis`, copy `.env.example` to `.env`, then `npm ci && npm run migrate && npm run dev`.
 
@@ -73,7 +75,9 @@ Set `METRICS_TOKEN` to a random secret of at least 32 characters to enable `GET 
 
 ```mermaid
 flowchart LR
-  Client --> API[Express API]
+  Browser --> Web[Next.js research desk]
+  Web --> API[Express API]
+  CLI[API clients] --> API
   API --> PG[(PostgreSQL)]
   API --> Outbox[(Transactional outbox)]
   Outbox --> Publisher
@@ -85,7 +89,7 @@ flowchart LR
   API --> LLM[Answer provider]
 ```
 
-PostgreSQL is the authority for identities, memberships, jobs, processed-event records, vectors, and usage. [ADR 0001](docs/adr/0001-workspace-boundary.md) records tenant isolation; [ADR 0002](docs/adr/0002-outbox-processing.md) explains delivery guarantees; [ADR 0003](docs/adr/0003-embeddings-and-search.md) explains vector checkpointing and search; [ADR 0004](docs/adr/0004-grounded-answers.md) explains citation validation and answer cost; [ADR 0005](docs/adr/0005-workspace-admission.md) explains workspace backlog limits; [ADR 0006](docs/adr/0006-upload-idempotency.md) explains upload retry safety; [ADR 0007](docs/adr/0007-api-rate-limits.md) explains edge limits and Redis outages; [ADR 0008](docs/adr/0008-operational-metrics.md) explains operational metrics; [ADR 0009](docs/adr/0009-provider-budget.md) explains provider capacity. Request, event, and job IDs appear in structured logs.
+PostgreSQL is the authority for identities, memberships, jobs, processed-event records, vectors, and usage. [ADR 0001](docs/adr/0001-workspace-boundary.md) records tenant isolation; [ADR 0002](docs/adr/0002-outbox-processing.md) explains delivery guarantees; [ADR 0003](docs/adr/0003-embeddings-and-search.md) explains vector checkpointing and search; [ADR 0004](docs/adr/0004-grounded-answers.md) explains citation validation and answer cost; [ADR 0005](docs/adr/0005-workspace-admission.md) explains workspace backlog limits; [ADR 0006](docs/adr/0006-upload-idempotency.md) explains upload retry safety; [ADR 0007](docs/adr/0007-api-rate-limits.md) explains edge limits and Redis outages; [ADR 0008](docs/adr/0008-operational-metrics.md) explains operational metrics; [ADR 0009](docs/adr/0009-provider-budget.md) explains provider capacity; [ADR 0010](docs/adr/0010-browser-session-boundary.md) explains the browser session boundary. Request, event, and job IDs appear in structured logs.
 
 ## Verification
 
@@ -93,6 +97,9 @@ PostgreSQL is the authority for identities, memberships, jobs, processed-event r
 npm run typecheck
 npm run lint
 npm run format:check
+npm run typecheck --prefix web
+npm run test --prefix web
+npm run build --prefix web
 docker compose exec postgres createdb -U app research_test
 TEST_DATABASE_URL=postgres://app:app@localhost:5433/research_test \
   TEST_REDIS_URL=redis://localhost:6380 npm run test:integration
@@ -119,3 +126,5 @@ For metrics, set `METRICS_TOKEN` and restart the API. Upload and process a docum
 For provider capacity, use a non-production provider key and set `EMBEDDING_REQUESTS_PER_MINUTE=1` on both API and worker. Upload two documents in one minute: the first embedding call uses the shared slot, while the second job waits until the next minute. A search in that minute returns 503 with `Retry-After`. Check that the waiting job has no dead-letter record and completes after the window resets. The automated test exercises the same behavior without an external API key.
 
 For provider 429 handling, the integration tests inject a temporary 429 with `Retry-After` and a credit-exhaustion 429. Check that the temporary error keeps its bounded retry count, while credit exhaustion immediately sets the PostgreSQL job to `failed` and creates a dead-letter record. Replaying that event must leave it failed; only manual retry with a new event can resume it.
+
+For the browser boundary, sign in and create a workspace at port 3001, then refresh: the session and workspace persist. Sign in as a second user in a private window: the first workspace must be absent. Tamper with the `sourcebook_session` cookie in browser dev tools and refresh: access should return 401. A cross-origin POST to `/api/workspaces` should return 403.

@@ -1,4 +1,6 @@
 node_modules
 dist
 coverage
+web/.next
+web/tsconfig.tsbuildinfo
 package-lock.json
