@@ -1,6 +1,6 @@
 # Document research platform
 
-An incremental, multi-tenant document research platform. **Current slice:** authentication, workspaces, private PDF/text uploads, transactional outbox, BullMQ extraction and embedding, pgvector search, grounded answers with citations, job progress, retries, dead-letter records, and approximate token usage. A frontend is a later slice.
+An incremental, multi-tenant document research platform. **Current slice:** authentication, workspaces, private PDF/text uploads, transactional outbox, workspace backlog control, BullMQ extraction and embedding, pgvector search, grounded answers with citations, job progress, retries, dead-letter records, and approximate token usage. A frontend is a later slice.
 
 ## Local setup
 
@@ -53,6 +53,8 @@ curl http://localhost:3000/workspaces/<workspace-id>/usage \
 
 `POST /auth/login` accepts the same credentials. `POST /auth/logout` revokes the bearer token. `GET /workspaces` lists only memberships for the caller. A nonmember receives 404 for workspace, document, and job IDs. Files are never served directly. Uploads accept one PDF or UTF-8 text file up to 5 MB per request. `GET /workspaces/:workspaceId/documents` lists document metadata. `GET /workspaces/:workspaceId/jobs?status=failed` lists failed jobs; `POST /jobs/:jobId/retry` retries one. Set `MAX_PROCESSING_ATTEMPTS` from 1 to 10 to change the retry budget for new jobs.
 
+The API accepts at most 20 queued or processing jobs per workspace by default (`MAX_PENDING_JOBS_PER_WORKSPACE`, 1–100). Upload, reindex, and manual retry return `429 workspace_job_limit` when full. A finished or failed job frees a slot. The worker still handles one active job per workspace; the cap bounds backlog but does not guarantee strict fairness in the shared queue.
+
 Wait until the job is `completed` before searching. Search allows at most 10 queries per workspace per minute and `topK` from 1 to 10. Local Compose uses deterministic lexical vectors for key-free development; set `EMBEDDING_PROVIDER=openai` and `OPENAI_API_KEY` on both API and worker for semantic embeddings. The OpenAI adapter uses `text-embedding-3-small` with 1536 dimensions. Update the configurable token price as provider pricing changes. Existing completed documents can be indexed for a new model with `POST /workspaces/:workspaceId/documents/:documentId/reindex`; it returns a new job ID. Search only reads vectors for the active model.
 
 Questions have a separate limit of three per workspace per minute. Local Compose returns a matching sentence from retrieved text, or abstains; it does not use an LLM. Set `LLM_PROVIDER=openai` and `OPENAI_API_KEY` on the API for generated answers. The default LLM model is `gpt-4o-mini`; update `LLM_MODEL` and both token price variables together. The example prices reflect the [OpenAI model page](https://developers.openai.com/api/docs/models/gpt-4o-mini) at the time of this phase. Citations are validated against retrieved chunk IDs, but the application cannot automatically prove every claim is supported by the cited text.
@@ -73,7 +75,7 @@ flowchart LR
   API --> LLM[Answer provider]
 ```
 
-PostgreSQL is the authority for identities, memberships, jobs, processed-event records, vectors, and usage. [ADR 0001](docs/adr/0001-workspace-boundary.md) records tenant isolation; [ADR 0002](docs/adr/0002-outbox-processing.md) explains delivery guarantees; [ADR 0003](docs/adr/0003-embeddings-and-search.md) explains vector checkpointing and search; [ADR 0004](docs/adr/0004-grounded-answers.md) explains citation validation and answer cost. Request, event, and job IDs appear in structured logs.
+PostgreSQL is the authority for identities, memberships, jobs, processed-event records, vectors, and usage. [ADR 0001](docs/adr/0001-workspace-boundary.md) records tenant isolation; [ADR 0002](docs/adr/0002-outbox-processing.md) explains delivery guarantees; [ADR 0003](docs/adr/0003-embeddings-and-search.md) explains vector checkpointing and search; [ADR 0004](docs/adr/0004-grounded-answers.md) explains citation validation and answer cost; [ADR 0005](docs/adr/0005-workspace-admission.md) explains workspace backlog limits. Request, event, and job IDs appear in structured logs.
 
 ## Verification
 
@@ -95,3 +97,5 @@ Upload a file containing `%PDF-broken` as `application/pdf`. Poll its job: it mo
 For embedding recovery, interrupt a worker after one batch is saved, restart it, and observe that stored vectors are skipped. If the provider completed a request but the worker died before the batch commit, the external request may repeat; the usage endpoint counts committed batches, so it is an estimate.
 
 For answer behavior, ask about a topic absent from all indexed documents. The local provider should abstain; the OpenAI provider is instructed to abstain when excerpts lack support. Ask as a nonmember and verify a 404 before any provider call. The automated test also injects a citation outside the retrieved set and verifies rejection.
+
+For admission control, set `MAX_PENDING_JOBS_PER_WORKSPACE=1` and restart the API. Stop the worker, then upload two files to the same workspace: the first returns 202 and the second returns 429. Upload to another workspace to see its independent slot. Restart the worker; after the first job completes, the second upload can be retried.

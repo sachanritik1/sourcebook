@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { Queue } from "bullmq";
 import IORedis from "ioredis";
@@ -72,6 +72,9 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
 
   beforeAll(async () => {
     await migrate(databaseUrl!);
+  });
+
+  beforeEach(async () => {
     await pool!.query(
       "TRUNCATE dead_letter_jobs, processed_events, document_chunks, outbox_events, processing_jobs, documents, sessions, workspace_memberships, workspaces, users CASCADE",
     );
@@ -107,6 +110,144 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
       .expect(201);
     return { owner, outsider, workspaceId: workspace.body.id as string };
   }
+
+  function appWithPendingLimit(limit: number) {
+    const previous = process.env.MAX_PENDING_JOBS_PER_WORKSPACE;
+    process.env.MAX_PENDING_JOBS_PER_WORKSPACE = String(limit);
+    try {
+      return createApp(pool!);
+    } finally {
+      if (previous === undefined)
+        delete process.env.MAX_PENDING_JOBS_PER_WORKSPACE;
+      else process.env.MAX_PENDING_JOBS_PER_WORKSPACE = previous;
+    }
+  }
+
+  it("admits only one of two concurrent uploads at the last workspace slot", async () => {
+    const { owner, workspaceId } = await setup();
+    const capped = appWithPendingLimit(1);
+    const uploads = await Promise.all(
+      ["first", "second"].map((name) =>
+        request(capped)
+          .post(`/workspaces/${workspaceId}/documents`)
+          .auth(owner.body.token, { type: "bearer" })
+          .attach("file", Buffer.from(`${name} admission evidence`), {
+            filename: `${name}.txt`,
+            contentType: "text/plain",
+          }),
+      ),
+    );
+    expect(uploads.map((response) => response.status).sort()).toEqual([
+      202, 429,
+    ]);
+    expect(
+      uploads.find((response) => response.status === 429)?.body.error,
+    ).toBe("workspace_job_limit");
+    const rows = await pool!.query(
+      `SELECT count(*)::int AS count FROM processing_jobs WHERE workspace_id = $1`,
+      [workspaceId],
+    );
+    expect(rows.rows[0].count).toBe(1);
+    const atomic = await pool!.query(
+      `SELECT (SELECT count(*)::int FROM documents WHERE workspace_id = $1) AS documents,
+              (SELECT count(*)::int FROM outbox_events WHERE workspace_id = $1) AS events`,
+      [workspaceId],
+    );
+    expect(atomic.rows[0]).toEqual({ documents: 1, events: 1 });
+    const other = await setup();
+    await request(capped)
+      .post(`/workspaces/${other.workspaceId}/documents`)
+      .auth(other.owner.body.token, { type: "bearer" })
+      .attach("file", Buffer.from("other workspace"), {
+        filename: "other.txt",
+        contentType: "text/plain",
+      })
+      .expect(202);
+    const accepted = uploads.find((response) => response.status === 202)!;
+    const event = await pool!.query(
+      "SELECT payload FROM outbox_events WHERE job_id = $1",
+      [accepted.body.jobId],
+    );
+    await processDocumentEvent(
+      pool!,
+      event.rows[0].payload as DocumentEvent,
+      1,
+      embeddings,
+    );
+    await request(capped)
+      .post(`/workspaces/${workspaceId}/documents`)
+      .auth(owner.body.token, { type: "bearer" })
+      .attach("file", Buffer.from("capacity released"), {
+        filename: "released.txt",
+        contentType: "text/plain",
+      })
+      .expect(202);
+  });
+
+  it("applies workspace capacity to reindex and failed-job retry", async () => {
+    const { owner, workspaceId } = await setup();
+    const capped = appWithPendingLimit(1);
+    const upload = await request(capped)
+      .post(`/workspaces/${workspaceId}/documents`)
+      .auth(owner.body.token, { type: "bearer" })
+      .attach("file", Buffer.from("reindex capacity"), {
+        filename: "reindex-capacity.txt",
+        contentType: "text/plain",
+      })
+      .expect(202);
+    const event = await pool!.query(
+      "SELECT payload FROM outbox_events WHERE job_id = $1",
+      [upload.body.jobId],
+    );
+    await processDocumentEvent(
+      pool!,
+      event.rows[0].payload as DocumentEvent,
+      1,
+      embeddings,
+    );
+    const queued = await request(capped)
+      .post(`/workspaces/${workspaceId}/documents`)
+      .auth(owner.body.token, { type: "bearer" })
+      .attach("file", Buffer.from("retry capacity"), {
+        filename: "retry-capacity.txt",
+        contentType: "text/plain",
+      })
+      .expect(202);
+    await request(capped)
+      .post(
+        `/workspaces/${workspaceId}/documents/${upload.body.documentId}/reindex`,
+      )
+      .auth(owner.body.token, { type: "bearer" })
+      .expect(429);
+    const queuedEvent = await pool!.query(
+      "SELECT payload FROM outbox_events WHERE job_id = $1",
+      [queued.body.jobId],
+    );
+    await recordFailure(
+      pool!,
+      queuedEvent.rows[0].payload as DocumentEvent,
+      3,
+      3,
+      new Error("forced failure"),
+    );
+    await request(capped)
+      .post(`/workspaces/${workspaceId}/documents`)
+      .auth(owner.body.token, { type: "bearer" })
+      .attach("file", Buffer.from("occupy slot"), {
+        filename: "occupy.txt",
+        contentType: "text/plain",
+      })
+      .expect(202);
+    await request(capped)
+      .post(`/jobs/${queued.body.jobId}/retry`)
+      .auth(owner.body.token, { type: "bearer" })
+      .expect(429);
+    const stillFailed = await pool!.query(
+      "SELECT status FROM processing_jobs WHERE id = $1",
+      [queued.body.jobId],
+    );
+    expect(stillFailed.rows[0].status).toBe("failed");
+  });
 
   it("commits upload and outbox together, publishes replay safely, and processes once", async () => {
     const { owner, outsider, workspaceId } = await setup();

@@ -4,6 +4,10 @@ import type { Pool } from "pg";
 import { z } from "zod";
 import { requireUser } from "../auth/sessions";
 import { HttpError } from "../http/errors";
+import {
+  configuredPendingJobLimit,
+  requireWorkspaceCapacity,
+} from "../processing/admission";
 
 const jobSelect = `SELECT j.id, j.document_id AS "documentId", j.workspace_id AS "workspaceId",
   j.status, j.stage, j.progress, j.attempts_made AS "attemptsMade",
@@ -13,6 +17,7 @@ const jobSelect = `SELECT j.id, j.document_id AS "documentId", j.workspace_id AS
 
 export function jobRoutes(pool: Pool): Router {
   const router = Router();
+  const pendingLimit = configuredPendingJobLimit();
   router.use(requireUser(pool));
 
   router.get("/:jobId", async (req, res) => {
@@ -49,6 +54,7 @@ export function jobRoutes(pool: Pool): Router {
           "job_not_failed",
           "Only failed jobs can be retried",
         );
+      await requireWorkspaceCapacity(client, job.workspace_id, pendingLimit);
       const eventId = randomUUID();
       await client.query(
         `UPDATE processing_jobs SET current_event_id = $2, status = 'queued', stage = 'waiting_for_publisher',

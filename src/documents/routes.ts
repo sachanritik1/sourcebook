@@ -7,6 +7,10 @@ import { z } from "zod";
 import { requireUser } from "../auth/sessions";
 import { HttpError } from "../http/errors";
 import { configuredMaxAttempts } from "../processing/types";
+import {
+  configuredPendingJobLimit,
+  requireWorkspaceCapacity,
+} from "../processing/admission";
 
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
 const upload = multer({
@@ -54,6 +58,7 @@ function validatedFile(file: Express.Multer.File | undefined): {
 
 export function documentRoutes(pool: Pool): Router {
   const router = Router();
+  const pendingLimit = configuredPendingJobLimit();
   router.use(requireUser(pool));
 
   router.post(
@@ -94,6 +99,7 @@ export function documentRoutes(pool: Pool): Router {
             "workspace_not_found",
             "Workspace not found",
           );
+        await requireWorkspaceCapacity(client, workspaceId, pendingLimit);
         const documentId = randomUUID();
         const jobId = randomUUID();
         const eventId = randomUUID();
@@ -187,6 +193,7 @@ export function documentRoutes(pool: Pool): Router {
             "document_not_completed",
             "Only completed documents can be reindexed",
           );
+        await requireWorkspaceCapacity(client, workspaceId, pendingLimit);
         const jobId = randomUUID();
         const eventId = randomUUID();
         await client.query(

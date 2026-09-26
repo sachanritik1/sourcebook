@@ -52,6 +52,7 @@ services:
       PORT: 3000
       LOG_LEVEL: info
       MAX_PROCESSING_ATTEMPTS: ${MAX_PROCESSING_ATTEMPTS:-3}
+      MAX_PENDING_JOBS_PER_WORKSPACE: ${MAX_PENDING_JOBS_PER_WORKSPACE:-20}
     ports:
       - "3000:3000"
     depends_on:
