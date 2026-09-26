@@ -7,6 +7,7 @@ import { createPool } from "../db/pool";
 import { createQueue } from "./queue";
 import { documentEventSchema } from "./types";
 import { recordFailure } from "./processor";
+import { PROVIDER_AWARE_BACKOFF } from "./backoff";
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? "info" });
 
@@ -37,7 +38,7 @@ export async function publishPending(
       await queue.add("document.process", event, {
         jobId: event.eventId,
         attempts: row.max_attempts,
-        backoff: { type: "exponential", delay: 1000 },
+        backoff: { type: PROVIDER_AWARE_BACKOFF, delay: 1000 },
         removeOnComplete: { age: 7 * 24 * 60 * 60, count: 1000 },
         removeOnFail: false,
       });

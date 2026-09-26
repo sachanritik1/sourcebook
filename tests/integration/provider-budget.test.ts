@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, describe, expect, it } from "vitest";
 import IORedis from "ioredis";
 import {
+  isProviderQuotaError,
   LocalLexicalEmbeddings,
   providerRetryAfterSeconds,
 } from "../../src/ai/embeddings";
@@ -11,6 +12,10 @@ import {
   ProviderBudgetError,
 } from "../../src/ai/provider-budget";
 import { FixedWindowLimiter } from "../../src/rate-limit/fixed-window";
+import {
+  PROVIDER_AWARE_BACKOFF,
+  providerAwareBackoff,
+} from "../../src/processing/backoff";
 
 const redisUrl = process.env.TEST_REDIS_URL;
 
@@ -99,5 +104,21 @@ describe.skipIf(!redisUrl)("shared provider budgets", () => {
     });
     expect(providerRetryAfterSeconds(error)).toBe(47);
     expect(providerRetryAfterSeconds(new Error("other"))).toBe(30);
+    const delay = providerAwareBackoff(1, PROVIDER_AWARE_BACKOFF, error);
+    expect(delay).toBeGreaterThanOrEqual(47_000);
+    expect(delay).toBeLessThan(48_000);
+    const ordinary = providerAwareBackoff(
+      2,
+      PROVIDER_AWARE_BACKOFF,
+      new Error("temporary"),
+    );
+    expect(ordinary).toBeGreaterThanOrEqual(2_000);
+    expect(ordinary).toBeLessThan(3_000);
+    const quota = Object.assign(new Error("credits exhausted"), {
+      status: 429,
+      code: "credit_balance_exhausted",
+    });
+    expect(isProviderQuotaError(quota)).toBe(true);
+    expect(isProviderQuotaError(error)).toBe(false);
   });
 });

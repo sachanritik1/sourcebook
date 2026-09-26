@@ -1,10 +1,11 @@
 import "dotenv/config";
-import { DelayedError, Worker, type Job } from "bullmq";
+import { DelayedError, UnrecoverableError, Worker, type Job } from "bullmq";
 import IORedis from "ioredis";
 import pino from "pino";
 import type { Pool } from "pg";
 import {
   createEmbeddingProvider,
+  isProviderQuotaError,
   type EmbeddingProvider,
 } from "../ai/embeddings";
 import { limitEmbeddings, ProviderBudgetError } from "../ai/provider-budget";
@@ -17,6 +18,7 @@ import {
   WorkspaceBusyError,
 } from "./processor";
 import { documentEventSchema, QUEUE_NAME, type DocumentEvent } from "./types";
+import { providerAwareBackoff } from "./backoff";
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? "info" });
 
@@ -62,7 +64,14 @@ export async function processQueuedDocument(
       );
       throw new DelayedError();
     }
-    await recordFailure(pool, event, attempt, job.opts.attempts ?? 1, error);
+    const quotaFailure = isProviderQuotaError(error);
+    await recordFailure(
+      pool,
+      event,
+      attempt,
+      quotaFailure ? attempt : (job.opts.attempts ?? 1),
+      error,
+    );
     logger.error(
       {
         err: error,
@@ -74,6 +83,8 @@ export async function processQueuedDocument(
       },
       "document processing failed",
     );
+    if (quotaFailure)
+      throw new UnrecoverableError("Provider quota requires operator action");
     throw error;
   }
 }
@@ -106,7 +117,12 @@ async function main() {
   const worker = new Worker(
     QUEUE_NAME,
     (job, token) => processQueuedDocument(pool, job, token, embeddings),
-    { connection, concurrency: 4, maxStalledCount: 2 },
+    {
+      connection,
+      concurrency: 4,
+      maxStalledCount: 2,
+      settings: { backoffStrategy: providerAwareBackoff },
+    },
   );
   worker.on("error", (error) => logger.error({ err: error }, "worker error"));
   worker.on("failed", (job, error) =>

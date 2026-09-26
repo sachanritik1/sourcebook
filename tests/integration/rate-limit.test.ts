@@ -190,5 +190,26 @@ describe.skipIf(!databaseUrl || !redisUrl)("API rate limits", () => {
     expect(response.body.error).toBe("provider_budget_exhausted");
     expect(Number(response.headers["retry-after"])).toBeGreaterThan(0);
     expect(providerCalls).toBe(0);
+
+    const quotaApp = createApp(pool!, {
+      embeddings: {
+        model: embeddings.model,
+        usdPerMillionTokens: 0,
+        embed: async () => {
+          throw Object.assign(new Error("credits exhausted"), {
+            status: 429,
+            code: "credit_balance_exhausted",
+          });
+        },
+      },
+      limiter: searchLimiter!,
+    });
+    const quota = await request(quotaApp)
+      .post(`/workspaces/${workspace.body.id}/search`)
+      .auth(owner.body.token, { type: "bearer" })
+      .send({ query: "capacity" })
+      .expect(503);
+    expect(quota.body.error).toBe("provider_quota_exhausted");
+    expect(quota.headers["retry-after"]).toBeUndefined();
   });
 });

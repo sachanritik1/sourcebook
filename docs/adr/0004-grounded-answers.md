@@ -15,7 +15,8 @@ Answers are synchronous and transient. Ingestion remains asynchronous. The endpo
 | Nonmember asks a question                                  | 404 before embedding or LLM work. Retrieval also checks membership in SQL.                              |
 | No completed vectors for the active embedding model        | Abstain with no citations; query embedding usage is recorded.                                           |
 | Provider returns an unknown citation number                | 502; no generated answer is returned. Provider token usage is still recorded.                           |
-| Provider returns 429                                       | 503 with `Retry-After`; the request does not immediately retry an expensive call.                       |
+| Provider returns temporary 429                             | 503 with `Retry-After`; the request does not immediately retry an expensive call.                       |
+| Provider returns a known quota 429                         | 503 without a retry hint; an operator must repair provider credit or limits.                            |
 | Provider completes but the API crashes before usage insert | A repeated request may incur another provider charge; persisted usage can underestimate actual charges. |
 
 Usage stores provider-reported input and output tokens and configurable per-million-token estimates. Local extraction reports zero provider tokens. Prices and model IDs are configuration, so changing models requires updating both. This is cost visibility, not billing.

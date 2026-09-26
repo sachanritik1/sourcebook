@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
-import { DelayedError, Queue, type Job } from "bullmq";
+import { DelayedError, Queue, UnrecoverableError, type Job } from "bullmq";
 import IORedis from "ioredis";
 import request from "supertest";
 import { createApp } from "../../src/app";
@@ -27,6 +27,7 @@ import {
 import { publishPending, reconcileJobs } from "../../src/processing/publisher";
 import type { DocumentEvent } from "../../src/processing/types";
 import { processQueuedDocument } from "../../src/processing/worker";
+import { PROVIDER_AWARE_BACKOFF } from "../../src/processing/backoff";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 const redisUrl = process.env.TEST_REDIS_URL;
@@ -404,6 +405,9 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
     expect(await publishPending(pool!, queue!)).toBe(1);
     const redisJob = await queue!.getJob(eventId);
     expect(redisJob?.id).toBe(eventId);
+    expect(redisJob?.opts.backoff).toMatchObject({
+      type: PROVIDER_AWARE_BACKOFF,
+    });
     expect((await queue!.getJobCounts()).waiting).toBe(1);
 
     await redisJob!.remove();
@@ -871,6 +875,60 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
       [upload.body.jobId],
     );
     expect(completed.rows[0].status).toBe("completed");
+  });
+
+  it("dead-letters a provider quota error without spending the remaining attempts", async () => {
+    const { owner, workspaceId } = await setup();
+    const upload = await request(app!)
+      .post(`/workspaces/${workspaceId}/documents`)
+      .set("Idempotency-Key", randomUUID())
+      .auth(owner.body.token, { type: "bearer" })
+      .attach("file", Buffer.from("Provider quota example."), {
+        filename: "quota.txt",
+        contentType: "text/plain",
+      })
+      .expect(202);
+    const row = await pool!.query(
+      "SELECT payload FROM outbox_events WHERE job_id = $1",
+      [upload.body.jobId],
+    );
+    const job = {
+      data: row.rows[0].payload as DocumentEvent,
+      attemptsMade: 0,
+      opts: { attempts: 3 },
+    } as Job<DocumentEvent>;
+    const quotaError = Object.assign(new Error("credits exhausted"), {
+      status: 429,
+      code: "credit_balance_exhausted",
+    });
+    const quotaProvider: EmbeddingProvider = {
+      model: embeddings.model,
+      usdPerMillionTokens: 0,
+      embed: async () => {
+        throw quotaError;
+      },
+    };
+    await expect(
+      processQueuedDocument(pool!, job, "test-lock", quotaProvider),
+    ).rejects.toBeInstanceOf(UnrecoverableError);
+    const result = await pool!.query(
+      `SELECT status, attempts_made AS attempts,
+       (SELECT count(*)::int FROM dead_letter_jobs WHERE job_id = $1) AS dead_letters
+       FROM processing_jobs WHERE id = $1`,
+      [upload.body.jobId],
+    );
+    expect(result.rows[0]).toEqual({
+      status: "failed",
+      attempts: 1,
+      dead_letters: 1,
+    });
+    // A replay after the DB commit but before BullMQ marks the job failed stays terminal.
+    await processDocumentEvent(pool!, job.data, 2, embeddings);
+    const replayed = await pool!.query(
+      "SELECT status, attempts_made FROM processing_jobs WHERE id = $1",
+      [upload.body.jobId],
+    );
+    expect(replayed.rows[0]).toEqual({ status: "failed", attempts_made: 1 });
   });
 
   it("protects operational metrics and reports persisted work and usage", async () => {

@@ -103,8 +103,27 @@ export function createEmbeddingProvider(): EmbeddingProvider {
   throw new Error(`Unknown EMBEDDING_PROVIDER: ${provider}`);
 }
 
-export function isProviderRateLimit(error: unknown): boolean {
+export function isProviderRateLimit(
+  error: unknown,
+): error is Error & { status: 429 } {
   return error instanceof Error && "status" in error && error.status === 429;
+}
+
+const NONRETRYABLE_QUOTA_CODES = new Set([
+  "credit_balance_exhausted",
+  "organization_spend_limit_exceeded",
+  "project_spend_limit_exceeded",
+  "organization_usage_limit_exceeded",
+  "insufficient_quota",
+]);
+
+export function isProviderQuotaError(error: unknown): boolean {
+  return (
+    isProviderRateLimit(error) &&
+    "code" in error &&
+    typeof error.code === "string" &&
+    NONRETRYABLE_QUOTA_CODES.has(error.code)
+  );
 }
 
 export function providerRetryAfterSeconds(error: unknown): number {

@@ -12,8 +12,9 @@ The local provider hashes words into deterministic vectors for development and t
 | ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
 | Worker crashes after vector batch commit        | Retry skips that batch; the unique workspace/chunk/model key prevents duplicate vectors.                                   |
 | Provider succeeds, worker crashes before commit | Retry may call the provider again. Cost tracking records committed batches only, so actual provider charges can be higher. |
-| Provider returns 429 during indexing            | BullMQ retries the job with its configured exponential backoff.                                                            |
-| Provider returns 429 during search              | API responds 503 with `Retry-After`; it does not run a hidden retry loop.                                                  |
+| Provider returns temporary 429 during indexing  | BullMQ retries within the attempt budget and waits at least the provider's `Retry-After` minimum.                          |
+| Provider returns quota 429 during indexing      | The job fails immediately and enters the dead-letter table for operator action.                                            |
+| Provider returns 429 during search              | API responds 503; temporary limits include `Retry-After`, while known quota errors do not.                                 |
 | Redis is unavailable during search              | Search fails closed; document ingestion remains durable through PostgreSQL outbox.                                         |
 | Provider model changes                          | Existing vectors are not mixed into new-model results. Reindex completed documents to populate the new model.              |
 

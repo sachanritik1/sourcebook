@@ -4,7 +4,7 @@
 
 An upload stores a private file (maximum 5 MB), a document row, a processing job, and an outbox event in one PostgreSQL transaction. The API returns `202` with the document and job IDs. A separate publisher leases outbox rows with `FOR UPDATE SKIP LOCKED`, adds BullMQ jobs with the outbox event ID as `jobId`, and marks rows published. The publisher periodically checks old queued or processing jobs and republishes events missing from Redis.
 
-The worker extracts text and commits overlapping chunks, then checkpoints embedding batches. It commits completed job status and a `processed_events` row after all vectors are present. A PostgreSQL advisory lock allows one active document per workspace across worker processes. BullMQ runs four concurrent jobs per worker and retries processing failures three times with exponential backoff. A permanently failed job enters a PostgreSQL dead-letter table; manual retry creates a new outbox event ID for the same logical job.
+The worker extracts text and commits overlapping chunks, then checkpoints embedding batches. It commits completed job status and a `processed_events` row after all vectors are present. A PostgreSQL advisory lock allows one active document per workspace across worker processes. BullMQ runs four concurrent jobs per worker and retries processing failures up to three times by default. Ordinary failures use exponential backoff; temporary provider 429s honor `Retry-After` (ADR 0009). A permanently failed job enters a PostgreSQL dead-letter table; manual retry creates a new outbox event ID for the same logical job.
 
 ## Failure cases
 

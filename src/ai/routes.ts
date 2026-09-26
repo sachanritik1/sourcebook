@@ -8,6 +8,7 @@ import type { Response } from "express";
 import {
   estimatedCostUsd,
   isProviderRateLimit,
+  isProviderQuotaError,
   providerRetryAfterSeconds,
   vectorLiteral,
   type EmbeddingProvider,
@@ -39,6 +40,12 @@ function rethrowProviderError(
       "Provider request capacity temporarily unavailable",
     );
   }
+  if (isProviderQuotaError(error))
+    throw new HttpError(
+      503,
+      "provider_quota_exhausted",
+      "Provider account quota requires operator action",
+    );
   if (isProviderRateLimit(error)) {
     res.setHeader("Retry-After", String(providerRetryAfterSeconds(error)));
     throw new HttpError(503, code, message);

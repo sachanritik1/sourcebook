@@ -63,7 +63,8 @@ export async function processDocumentEvent(
     if (
       !document ||
       document.current_event_id !== event.eventId ||
-      document.status === "completed"
+      document.status === "completed" ||
+      document.status === "failed"
     )
       return;
     const processed = await client.query(
