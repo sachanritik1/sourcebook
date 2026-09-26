@@ -9,6 +9,12 @@ import {
   type EmbeddingProvider,
 } from "../../src/ai/embeddings";
 import { SearchLimiter } from "../../src/ai/search-limiter";
+import {
+  citedAnswer,
+  InvalidCitationError,
+  LocalExtractiveAnswers,
+  type AnswerProvider,
+} from "../../src/ai/answers";
 import { migrate } from "../../src/db/migrate";
 import { createPool } from "../../src/db/pool";
 import { extractText } from "../../src/processing/extract";
@@ -53,9 +59,15 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
     ? new Queue("document-processing-integration", { connection: redis })
     : null;
   const embeddings = new LocalLexicalEmbeddings();
+  const answers = new LocalExtractiveAnswers();
   const app =
     pool && redis
-      ? createApp(pool, { embeddings, limiter: new SearchLimiter(redis, 1000) })
+      ? createApp(pool, {
+          embeddings,
+          limiter: new SearchLimiter(redis, 1000),
+          answers,
+          answerLimiter: new SearchLimiter(redis, 1000, "question-test"),
+        })
       : null;
 
   beforeAll(async () => {
@@ -336,6 +348,125 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
     expect(
       usage.body.usage.map((row: { operation: string }) => row.operation),
     ).toEqual(["embedding_index", "embedding_search"]);
+
+    const answer = await request(app!)
+      .post(`/workspaces/${first.workspaceId}/questions`)
+      .auth(first.owner.body.token, { type: "bearer" })
+      .send({ question: "What is the orchid evidence?" })
+      .expect(200);
+    expect(answer.body.answer).toContain("Orchid satellite evidence");
+    expect(answer.body.citations).toEqual([
+      {
+        chunkId: own.body.results[0].chunkId,
+        documentId: uploads[0].body.documentId,
+        filename: "first.txt",
+        ordinal: 0,
+      },
+    ]);
+    await request(app!)
+      .post(`/workspaces/${first.workspaceId}/questions`)
+      .auth(second.owner.body.token, { type: "bearer" })
+      .send({ question: "What is the orchid evidence?" })
+      .expect(404);
+    const afterAnswer = await request(app!)
+      .get(`/workspaces/${first.workspaceId}/usage`)
+      .auth(first.owner.body.token, { type: "bearer" })
+      .expect(200);
+    expect(
+      afterAnswer.body.usage.map((row: { operation: string }) => row.operation),
+    ).toEqual(["embedding_index", "embedding_search", "llm_answer"]);
+  });
+
+  it("rejects provider citations outside retrieved chunks", () => {
+    const chunk = {
+      chunkId: randomUUID(),
+      documentId: randomUUID(),
+      filename: "private.txt",
+      ordinal: 0,
+      content: "Private evidence",
+      score: 1,
+    };
+    expect(() =>
+      citedAnswer(
+        {
+          answer: "Unsupported claim",
+          insufficientEvidence: false,
+          citations: [2],
+          inputTokens: 12,
+          outputTokens: 3,
+        },
+        [chunk],
+      ),
+    ).toThrow(InvalidCitationError);
+  });
+
+  it("rejects an invalid provider citation at the API boundary and records usage", async () => {
+    const { owner, workspaceId } = await setup();
+    const upload = await request(app!)
+      .post(`/workspaces/${workspaceId}/documents`)
+      .auth(owner.body.token, { type: "bearer" })
+      .attach("file", Buffer.from("Citation boundary evidence."), {
+        filename: "source.txt",
+        contentType: "text/plain",
+      })
+      .expect(202);
+    const row = await pool!.query(
+      "SELECT payload FROM outbox_events WHERE job_id = $1",
+      [upload.body.jobId],
+    );
+    await processDocumentEvent(
+      pool!,
+      row.rows[0].payload as DocumentEvent,
+      1,
+      embeddings,
+    );
+    const badProvider: AnswerProvider = {
+      model: "bad-provider-test",
+      inputUsdPerMillionTokens: 1,
+      outputUsdPerMillionTokens: 1,
+      answer: async () => ({
+        answer: "Claim",
+        insufficientEvidence: false,
+        citations: [2],
+        inputTokens: 10,
+        outputTokens: 2,
+      }),
+    };
+    const badApp = createApp(pool!, {
+      embeddings,
+      limiter: new SearchLimiter(redis!, 1000, "search-bad-test"),
+      answers: badProvider,
+      answerLimiter: new SearchLimiter(redis!, 1000, "question-bad-test"),
+    });
+    const response = await request(badApp)
+      .post(`/workspaces/${workspaceId}/questions`)
+      .auth(owner.body.token, { type: "bearer" })
+      .send({ question: "What is the citation boundary?" })
+      .expect(502);
+    expect(response.body.error).toBe("invalid_provider_citation");
+    const usage = await pool!.query(
+      "SELECT input_tokens, output_tokens FROM usage_events WHERE workspace_id = $1 AND operation = 'llm_answer'",
+      [workspaceId],
+    );
+    expect(usage.rows).toEqual([{ input_tokens: 10, output_tokens: 2 }]);
+  });
+
+  it("does not call the answer provider when no chunks are indexed", async () => {
+    const { owner, workspaceId } = await setup();
+    const answer = await request(app!)
+      .post(`/workspaces/${workspaceId}/questions`)
+      .auth(owner.body.token, { type: "bearer" })
+      .send({ question: "What evidence exists?" })
+      .expect(200);
+    expect(answer.body.citations).toEqual([]);
+    expect(answer.body.answer).toContain("could not find enough evidence");
+    const usage = await request(app!)
+      .get(`/workspaces/${workspaceId}/usage`)
+      .auth(owner.body.token, { type: "bearer" })
+      .expect(200);
+    expect(
+      usage.body.usage.map((row: { operation: string }) => row.operation),
+    ).toEqual(["embedding_search"]);
   });
 
   it("resumes after a failed embedding batch without repeating committed batches", async () => {

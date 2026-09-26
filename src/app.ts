@@ -12,10 +12,16 @@ import { jobRoutes, workspaceJobRoutes } from "./jobs/routes";
 import { aiRoutes } from "./ai/routes";
 import type { EmbeddingProvider } from "./ai/embeddings";
 import { SearchLimiter } from "./ai/search-limiter";
+import type { AnswerProvider } from "./ai/answers";
 
 export function createApp(
   pool: Pool,
-  ai?: { embeddings: EmbeddingProvider; limiter: SearchLimiter },
+  ai?: {
+    embeddings: EmbeddingProvider;
+    limiter: SearchLimiter;
+    answers?: AnswerProvider;
+    answerLimiter?: SearchLimiter;
+  },
 ) {
   const app = express();
   const logger = pino({ level: process.env.LOG_LEVEL ?? "info" });
@@ -57,7 +63,11 @@ export function createApp(
   app.use("/workspaces", workspaceRoutes(pool));
   app.use("/workspaces", documentRoutes(pool));
   app.use("/workspaces", workspaceJobRoutes(pool));
-  if (ai) app.use("/workspaces", aiRoutes(pool, ai.embeddings, ai.limiter));
+  if (ai)
+    app.use(
+      "/workspaces",
+      aiRoutes(pool, ai.embeddings, ai.limiter, ai.answers, ai.answerLimiter),
+    );
   app.use("/jobs", jobRoutes(pool));
   app.use((_req, res) => res.status(404).json({ error: "not_found" }));
   app.use(errorHandler);
