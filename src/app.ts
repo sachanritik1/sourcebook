@@ -7,6 +7,8 @@ import type { Pool } from "pg";
 import { authRoutes } from "./auth/routes";
 import { workspaceRoutes } from "./workspaces/routes";
 import { errorHandler } from "./http/errors";
+import { documentRoutes } from "./documents/routes";
+import { jobRoutes, workspaceJobRoutes } from "./jobs/routes";
 
 export function createApp(pool: Pool) {
   const app = express();
@@ -47,6 +49,9 @@ export function createApp(pool: Pool) {
   });
   app.use("/auth", authRoutes(pool));
   app.use("/workspaces", workspaceRoutes(pool));
+  app.use("/workspaces", documentRoutes(pool));
+  app.use("/workspaces", workspaceJobRoutes(pool));
+  app.use("/jobs", jobRoutes(pool));
   app.use((_req, res) => res.status(404).json({ error: "not_found" }));
   app.use(errorHandler);
   return app;

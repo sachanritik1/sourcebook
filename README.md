@@ -1,6 +1,6 @@
 # Document research platform
 
-An incremental, multi-tenant document research platform. **Phase 1:** authentication, workspace ownership, tenant-scoped reads, migrations, and a local Express API. Document uploads, asynchronous processing, and RAG come in later phases.
+An incremental, multi-tenant document research platform. **Current slice:** authentication, workspace ownership, private PDF/text upload, transactional outbox, BullMQ extraction worker, job progress, retries, and dead-letter records. Embeddings, retrieval, answers, usage tracking, and a frontend are later slices.
 
 ## Local setup
 
@@ -28,9 +28,17 @@ curl -X POST http://localhost:3000/workspaces \
 
 curl http://localhost:3000/workspaces/<workspace-id> \
   -H 'authorization: Bearer <token>'
+
+curl -X POST http://localhost:3000/workspaces/<workspace-id>/documents \
+  -H 'authorization: Bearer <token>' \
+  -F 'file=@notes.pdf;type=application/pdf'
+# Returns 202: {"documentId":"...","jobId":"...","status":"queued"}
+
+curl http://localhost:3000/jobs/<job-id> \
+  -H 'authorization: Bearer <token>'
 ```
 
-`POST /auth/login` accepts the same credentials. `POST /auth/logout` revokes the bearer token. `GET /workspaces` lists only memberships for the caller. A nonmember receives 404 for a workspace ID.
+`POST /auth/login` accepts the same credentials. `POST /auth/logout` revokes the bearer token. `GET /workspaces` lists only memberships for the caller. A nonmember receives 404 for workspace, document, and job IDs. Files are never served directly. Uploads accept one PDF or UTF-8 text file up to 5 MB per request. `GET /workspaces/:workspaceId/documents` lists document metadata. `GET /workspaces/:workspaceId/jobs?status=failed` lists failed jobs; `POST /jobs/:jobId/retry` retries one. Set `MAX_PROCESSING_ATTEMPTS` from 1 to 10 to change the retry budget for new jobs.
 
 ## Architecture
 
@@ -38,12 +46,14 @@ curl http://localhost:3000/workspaces/<workspace-id> \
 flowchart LR
   Client --> API[Express API]
   API --> PG[(PostgreSQL)]
-  API -. next phase .-> Outbox[(Transactional outbox)]
-  Outbox -. publisher .-> Redis[(Redis / BullMQ)]
-  Redis -. jobs .-> Worker[Workers]
+  API --> Outbox[(Transactional outbox)]
+  Outbox --> Publisher
+  Publisher --> Redis[(Redis / BullMQ)]
+  Redis --> Worker[Extraction worker]
+  Worker --> PG
 ```
 
-PostgreSQL is the authority for identities and memberships. Redis is provisioned for a later processing phase but unused by this API. [ADR 0001](docs/adr/0001-workspace-boundary.md) records the tenant isolation decision. Request IDs appear in the `x-request-id` response header and structured logs.
+PostgreSQL is the authority for identities, memberships, jobs, and processed-event records. [ADR 0001](docs/adr/0001-workspace-boundary.md) records tenant isolation; [ADR 0002](docs/adr/0002-outbox-processing.md) explains delivery guarantees and crash recovery. Request, event, and job IDs appear in structured logs.
 
 ## Verification
 
@@ -52,7 +62,12 @@ npm run typecheck
 npm run lint
 npm run format:check
 docker compose exec postgres createdb -U app research_test
-TEST_DATABASE_URL=postgres://app:app@localhost:5433/research_test npm run test:integration
+TEST_DATABASE_URL=postgres://app:app@localhost:5433/research_test \
+  TEST_REDIS_URL=redis://localhost:6380 npm run test:integration
 ```
 
-The integration test clears identity tables in its target database. Use a dedicated test database.
+The integration tests clear application tables in their target database. Use a dedicated test database for them.
+
+## Failure experiment
+
+Upload a file containing `%PDF-broken` as `application/pdf`. Poll its job: it moves through retries to `failed`, then appears in the failed-job list. Call `POST /jobs/:jobId/retry` and observe a new event for the same job. Also try the upload while Redis is stopped: the API still returns a queued job because the outbox is in PostgreSQL; publishing resumes when Redis returns.

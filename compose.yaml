@@ -43,6 +43,7 @@ services:
       DATABASE_URL: postgres://app:app@postgres:5432/research
       PORT: 3000
       LOG_LEVEL: info
+      MAX_PROCESSING_ATTEMPTS: ${MAX_PROCESSING_ATTEMPTS:-3}
     ports:
       - "3000:3000"
     depends_on:
@@ -59,6 +60,32 @@ services:
       interval: 10s
       timeout: 3s
       retries: 10
+
+  publisher:
+    build: .
+    command: ["node", "dist/processing/publisher.js"]
+    environment:
+      DATABASE_URL: postgres://app:app@postgres:5432/research
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: info
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: ["node", "dist/processing/worker.js"]
+    environment:
+      DATABASE_URL: postgres://app:app@postgres:5432/research
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: info
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
 
 volumes:
   postgres_data:
