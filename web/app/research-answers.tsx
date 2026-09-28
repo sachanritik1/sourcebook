@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 
 type Citation = {
   chunkId: string;
@@ -32,10 +32,16 @@ function questionError(
   const hint = wait && /^\d+$/.test(wait) ? ` Wait about ${wait} seconds.` : "";
   if (response.status === 429)
     return `This workspace has reached its question limit.${hint}`;
+  if (body.error === "question_in_progress")
+    return "The first request is still running. Retry this question in a moment.";
+  if (body.error === "question_outcome_unknown")
+    return "The provider outcome is unknown. Check usage before starting a new attempt; it may incur another charge.";
+  if (body.error === "idempotency_key_reused")
+    return "This request key belongs to another question. Start a new attempt.";
   if (body.error === "provider_quota_exhausted")
     return "The AI provider needs an account quota update before questions can run.";
   if (response.status === 503)
-    return `The AI provider is temporarily unavailable.${hint} Check usage before resubmitting.`;
+    return `The question service is unavailable.${hint} Retry this request before starting a new attempt.`;
   if (response.status === 502)
     return "The answer provider returned an invalid citation. No answer was shown.";
   return "The question failed. Check usage before trying again.";
@@ -56,6 +62,9 @@ export default function ResearchAnswers({
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
   const [usageError, setUsageError] = useState("");
+  const [unknownOutcome, setUnknownOutcome] = useState(false);
+  const activeAttempt = useRef<{ question: string; key: string } | null>(null);
+  const attemptStorageKey = `research-question:${workspaceId}`;
 
   const loadUsage = useCallback(async () => {
     try {
@@ -86,10 +95,31 @@ export default function ResearchAnswers({
     setPending(true);
     setError("");
     setAnswer(null);
+    setUnknownOutcome(false);
+    let key =
+      activeAttempt.current?.question === text
+        ? activeAttempt.current.key
+        : crypto.randomUUID();
+    try {
+      const previous = JSON.parse(
+        sessionStorage.getItem(attemptStorageKey) ?? "null",
+      ) as { question?: string; key?: string } | null;
+      if (previous?.question === text && previous.key) key = previous.key;
+      sessionStorage.setItem(
+        attemptStorageKey,
+        JSON.stringify({ question: text, key }),
+      );
+    } catch {
+      // A live tab still uses one key for this submission if storage is disabled.
+    }
+    activeAttempt.current = { question: text, key };
     try {
       const response = await fetch(`/api/workspaces/${workspaceId}/questions`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": key,
+        },
         body: JSON.stringify({ question: text }),
       });
       if (response.status === 401) {
@@ -100,8 +130,17 @@ export default function ResearchAnswers({
         string,
         unknown
       >;
-      if (!response.ok) throw new Error(questionError(response, body));
+      if (!response.ok) {
+        if (body.error === "question_outcome_unknown") setUnknownOutcome(true);
+        throw new Error(questionError(response, body));
+      }
       setAnswer(body as Answer);
+      activeAttempt.current = null;
+      try {
+        sessionStorage.removeItem(attemptStorageKey);
+      } catch {
+        // Storage is optional; the server remains the source of truth.
+      }
     } catch (caught) {
       setError(
         caught instanceof Error ? caught.message : "The question failed.",
@@ -164,9 +203,27 @@ export default function ResearchAnswers({
             </div>
           </form>
           {error && (
-            <p className="notice" role="alert">
+            <div className="notice" role="alert">
               {error}
-            </p>
+              {unknownOutcome && (
+                <button
+                  type="button"
+                  className="text-button"
+                  onClick={() => {
+                    activeAttempt.current = null;
+                    try {
+                      sessionStorage.removeItem(attemptStorageKey);
+                    } catch {
+                      // A new key is still created through the in-memory fallback.
+                    }
+                    setUnknownOutcome(false);
+                    setError("");
+                  }}
+                >
+                  Start a new attempt
+                </button>
+              )}
+            </div>
           )}
           {answer && (
             <div className="answer-result" aria-live="polite">

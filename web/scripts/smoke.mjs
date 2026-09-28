@@ -131,14 +131,15 @@ assert.equal(
 );
 await waitForJob(workspace.id, owner, firstBody.jobId, "completed");
 
-async function ask(cookie, question) {
+async function ask(cookie, question, key = randomUUID()) {
   return request(`/api/workspaces/${workspace.id}/questions`, cookie, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "Idempotency-Key": key },
     body: JSON.stringify({ question }),
   });
 }
-const answered = await ask(owner, "What does the source note say?");
+const answerKey = randomUUID();
+const answered = await ask(owner, "What does the source note say?", answerKey);
 if (answered.status !== 200)
   throw new Error(`question: ${answered.status} ${await answered.text()}`);
 const grounded = await answered.json();
@@ -146,6 +147,10 @@ assert.match(grounded.answer, /source note/i);
 assert.equal(grounded.citations.length, 1);
 assert.equal(grounded.citations[0].filename, "source.txt");
 assert.match(grounded.citations[0].excerpt, /source note/i);
+const replayed = await ask(owner, "What does the source note say?", answerKey);
+assert.equal(replayed.status, 200);
+assert.deepEqual(await replayed.json(), grounded);
+assert.equal((await ask(owner, "Another question", answerKey)).status, 409);
 const absent = await ask(owner, "What about xylophone archaeology?");
 assert.equal(absent.status, 200);
 assert.deepEqual((await absent.json()).citations, []);
@@ -204,5 +209,5 @@ const wrongOrigin = await fetch(
 assert.equal(wrongOrigin.status, 403);
 
 console.log(
-  "PASS upload replay, tenant isolation, grounded answer, usage, job retry, origin check",
+  "PASS upload and answer replay, tenant isolation, usage, job retry, origin check",
 );

@@ -1,6 +1,6 @@
 # Document research platform
 
-An incremental, multi-tenant document research platform. **Current slice:** authentication, workspaces, a browser research desk with document uploads, job progress, grounded questions, citations, and usage; private PDF/text uploads with idempotent retries; transactional outbox; workspace backlog control; BullMQ extraction and embedding; pgvector search; API and provider rate limits; operational metrics; retries; and dead-letter records.
+An incremental, multi-tenant document research platform. **Current slice:** authentication, workspaces, a browser research desk with document uploads, job progress, grounded questions, citations, and usage; idempotent uploads and question replays; transactional outbox; workspace backlog control; BullMQ extraction and embedding; pgvector search; API and provider rate limits; operational metrics; retries; and dead-letter records.
 
 ## Local setup
 
@@ -47,6 +47,7 @@ curl -X POST http://localhost:3000/workspaces/<workspace-id>/search \
 
 curl -X POST http://localhost:3000/workspaces/<workspace-id>/questions \
   -H 'authorization: Bearer <token>' -H 'content-type: application/json' \
+  -H 'Idempotency-Key: <new-uuid-for-this-question>' \
   -d '{"question":"What does the document say about reliability?","topK":5}'
 # Returns {"answer":"...","citations":[{"chunkId":"...","documentId":"...","filename":"...","ordinal":0,"excerpt":"..."}],"model":"..."}
 
@@ -57,6 +58,8 @@ curl http://localhost:3000/workspaces/<workspace-id>/usage \
 `POST /auth/login` accepts the same credentials. `POST /auth/logout` revokes the bearer token. `GET /workspaces` lists only memberships for the caller. A nonmember receives 404 for workspace, document, and job IDs. Files are never served directly. Uploads accept one PDF or UTF-8 text file up to 5 MB per request. `GET /workspaces/:workspaceId/documents` lists document metadata. `GET /workspaces/:workspaceId/jobs?status=failed` lists failed jobs; `POST /jobs/:jobId/retry` retries one. Set `MAX_PROCESSING_ATTEMPTS` from 1 to 10 to change the retry budget for new jobs.
 
 Generate a UUID `Idempotency-Key` for each intended upload. Reuse that key and the same file/filename when retrying after a lost response: the API returns `200` with the original IDs and current status. A reused key with different upload data returns `409`. A new key means a new upload, even for identical bytes.
+
+Questions also require a UUID `Idempotency-Key`. Reuse the same key, question, and `topK` after a lost response: a completed request returns its saved answer without another provider call. `409 question_in_progress` means retry the same key shortly. `409 question_outcome_unknown` means the process may have died during a provider call; check usage before deliberately starting a new attempt with a new key. The same key with changed parameters returns `409 idempotency_key_reused`. Browser retries keep the key in session storage until an answer arrives.
 
 The API accepts at most 20 queued or processing jobs per workspace by default (`MAX_PENDING_JOBS_PER_WORKSPACE`, 1–100). Upload, reindex, and manual retry return `429 workspace_job_limit` when full. A finished or failed job frees a slot. The worker still handles one active job per workspace; the cap bounds backlog but does not guarantee strict fairness in the shared queue.
 
@@ -89,7 +92,7 @@ flowchart LR
   API --> LLM[Answer provider]
 ```
 
-PostgreSQL is the authority for identities, memberships, jobs, processed-event records, vectors, and usage. [ADR 0001](docs/adr/0001-workspace-boundary.md) records tenant isolation; [ADR 0002](docs/adr/0002-outbox-processing.md) explains delivery guarantees; [ADR 0003](docs/adr/0003-embeddings-and-search.md) explains vector checkpointing and search; [ADR 0004](docs/adr/0004-grounded-answers.md) explains citation validation and answer cost; [ADR 0005](docs/adr/0005-workspace-admission.md) explains workspace backlog limits; [ADR 0006](docs/adr/0006-upload-idempotency.md) explains upload retry safety; [ADR 0007](docs/adr/0007-api-rate-limits.md) explains edge limits and Redis outages; [ADR 0008](docs/adr/0008-operational-metrics.md) explains operational metrics; [ADR 0009](docs/adr/0009-provider-budget.md) explains provider capacity; [ADR 0010](docs/adr/0010-browser-session-boundary.md) explains the browser session boundary; [ADR 0011](docs/adr/0011-browser-upload-and-jobs.md) explains browser upload retries and job polling; [ADR 0012](docs/adr/0012-browser-research.md) explains visible evidence and question failure handling. Request, event, and job IDs appear in structured logs.
+PostgreSQL is the authority for identities, memberships, jobs, processed-event records, vectors, and usage. [ADR 0001](docs/adr/0001-workspace-boundary.md) records tenant isolation; [ADR 0002](docs/adr/0002-outbox-processing.md) explains delivery guarantees; [ADR 0003](docs/adr/0003-embeddings-and-search.md) explains vector checkpointing and search; [ADR 0004](docs/adr/0004-grounded-answers.md) explains citation validation and answer cost; [ADR 0005](docs/adr/0005-workspace-admission.md) explains workspace backlog limits; [ADR 0006](docs/adr/0006-upload-idempotency.md) explains upload retry safety; [ADR 0007](docs/adr/0007-api-rate-limits.md) explains edge limits and Redis outages; [ADR 0008](docs/adr/0008-operational-metrics.md) explains operational metrics; [ADR 0009](docs/adr/0009-provider-budget.md) explains provider capacity; [ADR 0010](docs/adr/0010-browser-session-boundary.md) explains the browser session boundary; [ADR 0011](docs/adr/0011-browser-upload-and-jobs.md) explains browser upload retries and job polling; [ADR 0012](docs/adr/0012-browser-research.md) explains visible evidence; [ADR 0013](docs/adr/0013-question-idempotency.md) explains replay and uncertain provider outcomes. Request, event, and job IDs appear in structured logs.
 
 ## Verification
 
@@ -133,4 +136,4 @@ For the browser boundary, sign in and create a workspace at port 3001, then refr
 
 For browser upload recovery, select one text file, stop the web container while its request is in flight, then restart it and retry the draft in the same tab if it remains available. The API should return the same IDs when the first attempt committed. If the tab was closed, check the document list before selecting the file again: the browser no longer has the original key. Upload a file containing `%PDF-broken` as a PDF to see a failed job and its Retry action.
 
-For browser research, wait until a document completes and ask a question using a phrase in that document. Confirm the answer lists the exact cited excerpt and that AI usage updates. Ask about an absent topic and check for an abstention without citations. Use a second account to request the first workspace's question or usage route; both return 404. Provider timeouts and lost responses are ambiguous: check usage before manually submitting an expensive question again.
+For browser research, wait until a document completes and ask a question using a phrase in that document. Confirm the answer lists the exact cited excerpt and that AI usage updates. Ask about an absent topic and check for an abstention without citations. Use a second account to request the first workspace's question or usage route; both return 404. Replay a completed question with the same key and inspect usage: the answer and totals stay unchanged. To simulate a crash after request reservation, stop the API during a slow provider call, restart it, and retry with the same key after two minutes. Expect `409 question_outcome_unknown`, then decide whether a new key and possible second charge are acceptable.

@@ -23,6 +23,13 @@ import {
   type AnswerProvider,
 } from "./answers";
 import { ProviderBudgetError } from "./provider-budget";
+import {
+  completeQuestion,
+  forgetQuestion,
+  markQuestionUncertain,
+  questionFingerprint,
+  reserveQuestion,
+} from "./question-requests";
 
 function rethrowProviderError(
   error: unknown,
@@ -163,6 +170,13 @@ export function aiRoutes(
   if (answers && answerLimiter)
     router.post("/:workspaceId/questions", async (req, res) => {
       const workspaceId = z.uuid().parse(req.params.workspaceId);
+      const key = z.uuid().safeParse(req.get("Idempotency-Key"));
+      if (!key.success)
+        throw new HttpError(
+          400,
+          "invalid_idempotency_key",
+          "Idempotency-Key must be a UUID",
+        );
       const { question, topK } = z
         .object({
           question: z.string().trim().min(1).max(2000),
@@ -176,114 +190,170 @@ export function aiRoutes(
       );
       if (!membership.rowCount)
         throw new HttpError(404, "workspace_not_found", "Workspace not found");
-      await requireWorkspaceBudget(
-        answerLimiter,
-        workspaceId,
-        res,
-        "question_rate_limited",
-        "Question limit reached for this workspace",
-      );
-      let queryEmbedding;
-      try {
-        queryEmbedding = await embeddings.embed([question]);
-      } catch (error) {
-        rethrowProviderError(
-          error,
-          res,
-          "embedding_provider_busy",
-          "Embedding provider is rate limited",
-        );
-      }
-      if (
-        queryEmbedding.vectors.length !== 1 ||
-        !Number.isInteger(queryEmbedding.inputTokens) ||
-        queryEmbedding.inputTokens < 0
-      )
-        throw new Error("Embedding provider returned invalid search response");
-      const chunks = await retrieveChunks(
+      const reservation = await reserveQuestion(
         pool,
         workspaceId,
         res.locals.userId,
-        embeddings.model,
-        vectorLiteral(queryEmbedding.vectors[0]!),
-        topK,
+        key.data,
+        questionFingerprint(question, topK),
       );
-      await pool.query(
-        `INSERT INTO usage_events (workspace_id, event_key, operation, model, input_tokens, estimated_cost_usd)
-       VALUES ($1, $2, 'embedding_search', $3, $4, $5)`,
-        [
-          workspaceId,
-          randomUUID(),
-          embeddings.model,
-          queryEmbedding.inputTokens,
-          estimatedCostUsd(
-            queryEmbedding.inputTokens,
-            embeddings.usdPerMillionTokens,
-          ),
-        ],
-      );
-      if (chunks.length === 0) {
-        res.json({
-          answer: INSUFFICIENT_EVIDENCE,
-          citations: [],
-          model: answers.model,
-        });
+      if (!reservation.fresh) {
+        res.json(reservation.response);
         return;
       }
-      const llmStarted = Date.now();
-      req.log.info(
-        { workspaceId, model: answers.model, retrievedChunks: chunks.length },
-        "answer provider request",
-      );
-      let draft;
+      let providerMayHaveRun = false;
       try {
-        draft = await answers.answer(question, chunks);
-      } catch (error) {
-        rethrowProviderError(
-          error,
-          res,
-          "llm_provider_busy",
-          "Answer provider is rate limited",
-        );
-      }
-      const llmLatencyMs = Date.now() - llmStarted;
-      await pool.query(
-        `INSERT INTO usage_events (workspace_id, event_key, operation, model, input_tokens, output_tokens, estimated_cost_usd, provider_latency_ms)
-       VALUES ($1, $2, 'llm_answer', $3, $4, $5, $6, $7)`,
-        [
+        await requireWorkspaceBudget(
+          answerLimiter,
           workspaceId,
-          randomUUID(),
-          answers.model,
-          draft.inputTokens,
-          draft.outputTokens,
-          answerCostUsd(draft, answers),
-          llmLatencyMs,
-        ],
-      );
-      let grounded;
-      try {
-        grounded = citedAnswer(draft, chunks);
-      } catch (error) {
-        if (error instanceof InvalidCitationError)
+          res,
+          "question_rate_limited",
+          "Question limit reached for this workspace",
+        );
+        providerMayHaveRun = true;
+        let queryEmbedding;
+        try {
+          queryEmbedding = await embeddings.embed([question]);
+        } catch (error) {
+          rethrowProviderError(
+            error,
+            res,
+            "embedding_provider_busy",
+            "Embedding provider is rate limited",
+          );
+        }
+        if (
+          queryEmbedding.vectors.length !== 1 ||
+          !Number.isInteger(queryEmbedding.inputTokens) ||
+          queryEmbedding.inputTokens < 0
+        )
+          throw new Error(
+            "Embedding provider returned invalid search response",
+          );
+        const chunks = await retrieveChunks(
+          pool,
+          workspaceId,
+          res.locals.userId,
+          embeddings.model,
+          vectorLiteral(queryEmbedding.vectors[0]!),
+          topK,
+        );
+        await pool.query(
+          `INSERT INTO usage_events (workspace_id, event_key, operation, model, input_tokens, estimated_cost_usd)
+           VALUES ($1, $2, 'embedding_search', $3, $4, $5)`,
+          [
+            workspaceId,
+            `${key.data}:embedding`,
+            embeddings.model,
+            queryEmbedding.inputTokens,
+            estimatedCostUsd(
+              queryEmbedding.inputTokens,
+              embeddings.usdPerMillionTokens,
+            ),
+          ],
+        );
+        if (chunks.length === 0) {
+          const response = {
+            answer: INSUFFICIENT_EVIDENCE,
+            citations: [],
+            model: answers.model,
+          };
+          // The embedding usage is already durable; this stores the replayable result.
+          const client = await pool.connect();
+          try {
+            await client.query("BEGIN");
+            await completeQuestion(client, workspaceId, key.data, response);
+            await client.query("COMMIT");
+          } catch (error) {
+            await client.query("ROLLBACK");
+            throw error;
+          } finally {
+            client.release();
+          }
+          res.json(response);
+          return;
+        }
+        const llmStarted = Date.now();
+        req.log.info(
+          {
+            workspaceId,
+            questionKey: key.data,
+            model: answers.model,
+            retrievedChunks: chunks.length,
+          },
+          "answer provider request",
+        );
+        let draft;
+        try {
+          draft = await answers.answer(question, chunks);
+        } catch (error) {
+          rethrowProviderError(
+            error,
+            res,
+            "llm_provider_busy",
+            "Answer provider is rate limited",
+          );
+        }
+        const llmLatencyMs = Date.now() - llmStarted;
+        let grounded;
+        let invalidCitation = false;
+        try {
+          grounded = citedAnswer(draft, chunks);
+        } catch (error) {
+          if (!(error instanceof InvalidCitationError)) throw error;
+          invalidCitation = true;
+        }
+        const response = grounded && { ...grounded, model: answers.model };
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+          await client.query(
+            `INSERT INTO usage_events (workspace_id, event_key, operation, model, input_tokens, output_tokens, estimated_cost_usd, provider_latency_ms)
+             VALUES ($1, $2, 'llm_answer', $3, $4, $5, $6, $7)`,
+            [
+              workspaceId,
+              `${key.data}:answer`,
+              answers.model,
+              draft.inputTokens,
+              draft.outputTokens,
+              answerCostUsd(draft, answers),
+              llmLatencyMs,
+            ],
+          );
+          if (response)
+            await completeQuestion(client, workspaceId, key.data, response);
+          await client.query("COMMIT");
+        } catch (error) {
+          await client.query("ROLLBACK");
+          throw error;
+        } finally {
+          client.release();
+        }
+        if (invalidCitation)
           throw new HttpError(
             502,
             "invalid_provider_citation",
             "Answer provider returned an invalid citation",
           );
+        req.log.info(
+          {
+            workspaceId,
+            questionKey: key.data,
+            model: answers.model,
+            citationCount: grounded!.citations.length,
+            llmLatencyMs,
+            llmInputTokens: draft.inputTokens,
+            llmOutputTokens: draft.outputTokens,
+          },
+          "grounded answer completed",
+        );
+        res.json(response);
+      } catch (error) {
+        if (providerMayHaveRun)
+          await markQuestionUncertain(pool, workspaceId, key.data);
+        else await forgetQuestion(pool, workspaceId, key.data);
         throw error;
       }
-      req.log.info(
-        {
-          workspaceId,
-          model: answers.model,
-          citationCount: grounded.citations.length,
-          llmLatencyMs,
-          llmInputTokens: draft.inputTokens,
-          llmOutputTokens: draft.outputTokens,
-        },
-        "grounded answer completed",
-      );
-      res.json({ ...grounded, model: answers.model });
     });
 
   router.get("/:workspaceId/usage", async (req, res) => {

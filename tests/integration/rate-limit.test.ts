@@ -147,10 +147,16 @@ describe.skipIf(!databaseUrl || !redisUrl)("API rate limits", () => {
     expect(search.body.error).toBe("rate_limit_unavailable");
     const question = await request(app)
       .post(`${base}/questions`)
+      .set("Idempotency-Key", randomUUID())
       .auth(owner.body.token, { type: "bearer" })
       .send({ question: "What evidence?" })
       .expect(503);
     expect(question.body.error).toBe("rate_limit_unavailable");
+    const reservation = await pool!.query(
+      "SELECT count(*)::int AS count FROM question_requests WHERE workspace_id = $1",
+      [workspace.body.id],
+    );
+    expect(reservation.rows[0].count).toBe(0);
   });
 
   it("returns Retry-After before calling a provider when shared capacity is full", async () => {

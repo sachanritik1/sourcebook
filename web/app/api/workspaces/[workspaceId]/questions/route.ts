@@ -23,6 +23,13 @@ export async function POST(
   if (!validUuid(workspaceId)) return notFound();
   const session = currentSession(request);
   if (!session) return unauthorized();
+  const key = request.headers.get("idempotency-key");
+  if (!key || !validUuid(key)) {
+    return NextResponse.json(
+      { error: "invalid_idempotency_key" },
+      { status: 400 },
+    );
+  }
   let body: unknown;
   try {
     body = await readJson(request);
@@ -44,6 +51,7 @@ export async function POST(
     method: "POST",
     token: session.token,
     body: { question: question.trim() },
+    idempotencyKey: key,
     timeoutMs: 70_000,
   });
 }

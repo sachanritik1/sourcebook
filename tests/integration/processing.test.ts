@@ -16,6 +16,7 @@ import {
   LocalExtractiveAnswers,
   type AnswerProvider,
 } from "../../src/ai/answers";
+import { questionFingerprint } from "../../src/ai/question-requests";
 import { migrate } from "../../src/db/migrate";
 import { createPool } from "../../src/db/pool";
 import { extractText } from "../../src/processing/extract";
@@ -588,6 +589,7 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
 
     const answer = await request(app!)
       .post(`/workspaces/${first.workspaceId}/questions`)
+      .set("Idempotency-Key", randomUUID())
       .auth(first.owner.body.token, { type: "bearer" })
       .send({ question: "What is the orchid evidence?" })
       .expect(200);
@@ -603,6 +605,7 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
     ]);
     await request(app!)
       .post(`/workspaces/${first.workspaceId}/questions`)
+      .set("Idempotency-Key", randomUUID())
       .auth(second.owner.body.token, { type: "bearer" })
       .send({ question: "What is the orchid evidence?" })
       .expect(404);
@@ -636,6 +639,141 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
         [chunk],
       ),
     ).toThrow(InvalidCitationError);
+  });
+
+  it("replays one concurrent question and records provider usage once", async () => {
+    const { owner, outsider, workspaceId } = await setup();
+    const upload = await request(app!)
+      .post(`/workspaces/${workspaceId}/documents`)
+      .set("Idempotency-Key", randomUUID())
+      .auth(owner.body.token, { type: "bearer" })
+      .attach("file", Buffer.from("Orchid evidence is in this note."), {
+        filename: "source.txt",
+        contentType: "text/plain",
+      })
+      .expect(202);
+    const event = await pool!.query(
+      "SELECT payload FROM outbox_events WHERE job_id = $1",
+      [upload.body.jobId],
+    );
+    await processDocumentEvent(
+      pool!,
+      event.rows[0].payload as DocumentEvent,
+      1,
+      embeddings,
+    );
+    let providerCalls = 0;
+    let releaseProvider = () => {};
+    let providerEntered = () => {};
+    const gate = new Promise<void>((resolve) => {
+      releaseProvider = resolve;
+    });
+    const entered = new Promise<void>((resolve) => {
+      providerEntered = resolve;
+    });
+    const delayedAnswers: AnswerProvider = {
+      ...answers,
+      answer: async (question, chunks) => {
+        providerCalls++;
+        providerEntered();
+        await gate;
+        return answers.answer(question, chunks);
+      },
+    };
+    const answerApp = createApp(pool!, {
+      embeddings,
+      limiter: new FixedWindowLimiter(redis!, 1000, "search-replay-test"),
+      answers: delayedAnswers,
+      answerLimiter: new FixedWindowLimiter(
+        redis!,
+        1000,
+        "question-replay-test",
+      ),
+    });
+    const key = randomUUID();
+    const ask = (question: string) =>
+      request(answerApp)
+        .post(`/workspaces/${workspaceId}/questions`)
+        .set("Idempotency-Key", key)
+        .auth(owner.body.token, { type: "bearer" })
+        .send({ question });
+    const first = ask("What does the orchid note say?").then(
+      (result) => result,
+    );
+    try {
+      await entered;
+      const pending = await ask("What does the orchid note say?").expect(409);
+      expect(pending.body.error).toBe("question_in_progress");
+      const mismatch = await ask("What is different?").expect(409);
+      expect(mismatch.body.error).toBe("idempotency_key_reused");
+      await request(answerApp)
+        .post(`/workspaces/${workspaceId}/questions`)
+        .set("Idempotency-Key", key)
+        .auth(outsider.body.token, { type: "bearer" })
+        .send({ question: "What does the orchid note say?" })
+        .expect(404);
+      await pool!.query(
+        "INSERT INTO workspace_memberships (workspace_id, user_id, role) VALUES ($1, $2, 'member')",
+        [workspaceId, outsider.body.userId],
+      );
+      const anotherMember = await request(answerApp)
+        .post(`/workspaces/${workspaceId}/questions`)
+        .set("Idempotency-Key", key)
+        .auth(outsider.body.token, { type: "bearer" })
+        .send({ question: "What does the orchid note say?" })
+        .expect(409);
+      expect(anotherMember.body.error).toBe("idempotency_key_reused");
+    } finally {
+      releaseProvider();
+    }
+    const completed = await first;
+    expect(completed.status).toBe(200);
+    const replayed = await ask("What does the orchid note say?").expect(200);
+    expect(replayed.body).toEqual(completed.body);
+    expect(providerCalls).toBe(1);
+    const usage = await pool!.query(
+      "SELECT operation, count(*)::int AS count FROM usage_events WHERE workspace_id = $1 AND event_key LIKE $2 GROUP BY operation ORDER BY operation",
+      [workspaceId, `${key}:%`],
+    );
+    expect(usage.rows).toEqual([
+      { operation: "embedding_search", count: 1 },
+      { operation: "llm_answer", count: 1 },
+    ]);
+  });
+
+  it("does not rerun a question with an uncertain or stale reservation", async () => {
+    const { owner, workspaceId } = await setup();
+    const question = "What evidence exists?";
+    for (const [status, age] of [
+      ["uncertain", "now()"],
+      ["in_progress", "now() - interval '3 minutes'"],
+    ]) {
+      const key = randomUUID();
+      await pool!.query(
+        `INSERT INTO question_requests
+         (workspace_id, idempotency_key, user_id, request_fingerprint, status, created_at)
+         VALUES ($1, $2, $3, $4, $5, ${age})`,
+        [
+          workspaceId,
+          key,
+          owner.body.userId,
+          questionFingerprint(question, 5),
+          status,
+        ],
+      );
+      const blocked = await request(app!)
+        .post(`/workspaces/${workspaceId}/questions`)
+        .set("Idempotency-Key", key)
+        .auth(owner.body.token, { type: "bearer" })
+        .send({ question })
+        .expect(409);
+      expect(blocked.body.error).toBe("question_outcome_unknown");
+    }
+    const usage = await pool!.query(
+      "SELECT count(*)::int AS count FROM usage_events WHERE workspace_id = $1",
+      [workspaceId],
+    );
+    expect(usage.rows[0].count).toBe(0);
   });
 
   it("rejects an invalid provider citation at the API boundary and records usage", async () => {
@@ -679,6 +817,7 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
     });
     const response = await request(badApp)
       .post(`/workspaces/${workspaceId}/questions`)
+      .set("Idempotency-Key", randomUUID())
       .auth(owner.body.token, { type: "bearer" })
       .send({ question: "What is the citation boundary?" })
       .expect(502);
@@ -692,13 +831,22 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
 
   it("does not call the answer provider when no chunks are indexed", async () => {
     const { owner, workspaceId } = await setup();
+    const key = randomUUID();
     const answer = await request(app!)
       .post(`/workspaces/${workspaceId}/questions`)
+      .set("Idempotency-Key", key)
       .auth(owner.body.token, { type: "bearer" })
       .send({ question: "What evidence exists?" })
       .expect(200);
     expect(answer.body.citations).toEqual([]);
     expect(answer.body.answer).toContain("could not find enough evidence");
+    const replayed = await request(app!)
+      .post(`/workspaces/${workspaceId}/questions`)
+      .set("Idempotency-Key", key)
+      .auth(owner.body.token, { type: "bearer" })
+      .send({ question: "What evidence exists?" })
+      .expect(200);
+    expect(replayed.body).toEqual(answer.body);
     const usage = await request(app!)
       .get(`/workspaces/${workspaceId}/usage`)
       .auth(owner.body.token, { type: "bearer" })
@@ -706,6 +854,11 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
     expect(
       usage.body.usage.map((row: { operation: string }) => row.operation),
     ).toEqual(["embedding_search"]);
+    const count = await pool!.query(
+      "SELECT count(*)::int AS count FROM usage_events WHERE event_key = $1",
+      [`${key}:embedding`],
+    );
+    expect(count.rows[0].count).toBe(1);
   });
 
   it("resumes after a failed embedding batch without repeating committed batches", async () => {
@@ -1006,6 +1159,7 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
     );
     await request(metricsApp)
       .post(`/workspaces/${workspaceId}/questions`)
+      .set("Idempotency-Key", randomUUID())
       .auth(owner.body.token, { type: "bearer" })
       .send({ question: "Where does a reliable answer come from?" })
       .expect(200);
