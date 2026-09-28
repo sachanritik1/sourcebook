@@ -1195,4 +1195,29 @@ describe.skipIf(!databaseUrl || !redisUrl)("document processing", () => {
       "Reliable document processing",
     );
   });
+
+  it("stops a PDF extraction that exceeds its time budget", async () => {
+    const previous = process.env.PDF_EXTRACTION_TIMEOUT_MS;
+    process.env.PDF_EXTRACTION_TIMEOUT_MS = "1";
+    try {
+      await expect(extractText(samplePdf(), "application/pdf")).rejects.toThrow(
+        "PDF extraction timed out",
+      );
+    } finally {
+      if (previous === undefined) delete process.env.PDF_EXTRACTION_TIMEOUT_MS;
+      else process.env.PDF_EXTRACTION_TIMEOUT_MS = previous;
+    }
+    expect(await extractText(samplePdf(), "application/pdf")).toContain(
+      "Reliable document processing",
+    );
+  });
+
+  it("keeps extracting after a malformed PDF child fails", async () => {
+    await expect(
+      extractText(Buffer.from("%PDF-broken"), "application/pdf"),
+    ).rejects.toThrow();
+    expect(await extractText(samplePdf(), "application/pdf")).toContain(
+      "Reliable document processing",
+    );
+  });
 });

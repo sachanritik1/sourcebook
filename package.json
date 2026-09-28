@@ -16,6 +16,7 @@
     "format:check": "prettier --check .",
     "format": "prettier --write .",
     "test": "vitest run",
+    "pretest:integration": "npm run build",
     "test:integration": "vitest run tests/integration"
   },
   "engines": {

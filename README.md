@@ -1,6 +1,6 @@
 # Document research platform
 
-An incremental, multi-tenant document research platform. **Current slice:** authentication, workspaces, a browser research desk with document uploads, job progress, grounded questions, citations, and usage; idempotent uploads and question replays; transactional outbox; workspace backlog control; BullMQ extraction and embedding; pgvector search; API and provider rate limits; operational metrics; retries; and dead-letter records.
+An incremental, multi-tenant document research platform. **Current slice:** authentication, workspaces, a browser research desk with document uploads, job progress, grounded questions, citations, and usage; idempotent uploads and question replays; transactional outbox; workspace backlog control; BullMQ extraction and embedding with bounded PDF parsing; pgvector search; API and provider rate limits; operational metrics; retries; and dead-letter records.
 
 ## Local setup
 
@@ -57,6 +57,8 @@ curl http://localhost:3000/workspaces/<workspace-id>/usage \
 
 `POST /auth/login` accepts the same credentials. `POST /auth/logout` revokes the bearer token. `GET /workspaces` lists only memberships for the caller. A nonmember receives 404 for workspace, document, and job IDs. Files are never served directly. Uploads accept one PDF or UTF-8 text file up to 5 MB per request. `GET /workspaces/:workspaceId/documents` lists document metadata. `GET /workspaces/:workspaceId/jobs?status=failed` lists failed jobs; `POST /jobs/:jobId/retry` retries one. Set `MAX_PROCESSING_ATTEMPTS` from 1 to 10 to change the retry budget for new jobs.
 
+PDF text extraction runs in a fresh child process with a 30-second deadline (`PDF_EXTRACTION_TIMEOUT_MS`, 1–120000), a 128 MB Node old-heap limit, and bounded output. This contains a parser crash or timeout to one job; it is not an OS sandbox for hostile PDFs. See ADR 0014.
+
 Generate a UUID `Idempotency-Key` for each intended upload. Reuse that key and the same file/filename when retrying after a lost response: the API returns `200` with the original IDs and current status. A reused key with different upload data returns `409`. A new key means a new upload, even for identical bytes.
 
 Questions also require a UUID `Idempotency-Key`. Reuse the same key, question, and `topK` after a lost response: a completed request returns its saved answer without another provider call. `409 question_in_progress` means retry the same key shortly. `409 question_outcome_unknown` means the process may have died during a provider call; check usage before deliberately starting a new attempt with a new key. The same key with changed parameters returns `409 idempotency_key_reused`. Browser retries keep the key in session storage until an answer arrives.
@@ -86,13 +88,14 @@ flowchart LR
   Outbox --> Publisher
   Publisher --> Redis[(Redis / BullMQ)]
   Redis --> Worker[Extraction and embedding worker]
+  Worker --> PDF[Bounded PDF child process]
   Worker --> PG
   API --> Vector[pgvector exact search]
   Vector --> PG
   API --> LLM[Answer provider]
 ```
 
-PostgreSQL is the authority for identities, memberships, jobs, processed-event records, vectors, and usage. [ADR 0001](docs/adr/0001-workspace-boundary.md) records tenant isolation; [ADR 0002](docs/adr/0002-outbox-processing.md) explains delivery guarantees; [ADR 0003](docs/adr/0003-embeddings-and-search.md) explains vector checkpointing and search; [ADR 0004](docs/adr/0004-grounded-answers.md) explains citation validation and answer cost; [ADR 0005](docs/adr/0005-workspace-admission.md) explains workspace backlog limits; [ADR 0006](docs/adr/0006-upload-idempotency.md) explains upload retry safety; [ADR 0007](docs/adr/0007-api-rate-limits.md) explains edge limits and Redis outages; [ADR 0008](docs/adr/0008-operational-metrics.md) explains operational metrics; [ADR 0009](docs/adr/0009-provider-budget.md) explains provider capacity; [ADR 0010](docs/adr/0010-browser-session-boundary.md) explains the browser session boundary; [ADR 0011](docs/adr/0011-browser-upload-and-jobs.md) explains browser upload retries and job polling; [ADR 0012](docs/adr/0012-browser-research.md) explains visible evidence; [ADR 0013](docs/adr/0013-question-idempotency.md) explains replay and uncertain provider outcomes. Request, event, and job IDs appear in structured logs.
+PostgreSQL is the authority for identities, memberships, jobs, processed-event records, vectors, and usage. [ADR 0001](docs/adr/0001-workspace-boundary.md) records tenant isolation; [ADR 0002](docs/adr/0002-outbox-processing.md) explains delivery guarantees; [ADR 0003](docs/adr/0003-embeddings-and-search.md) explains vector checkpointing and search; [ADR 0004](docs/adr/0004-grounded-answers.md) explains citation validation and answer cost; [ADR 0005](docs/adr/0005-workspace-admission.md) explains workspace backlog limits; [ADR 0006](docs/adr/0006-upload-idempotency.md) explains upload retry safety; [ADR 0007](docs/adr/0007-api-rate-limits.md) explains edge limits and Redis outages; [ADR 0008](docs/adr/0008-operational-metrics.md) explains operational metrics; [ADR 0009](docs/adr/0009-provider-budget.md) explains provider capacity; [ADR 0010](docs/adr/0010-browser-session-boundary.md) explains the browser session boundary; [ADR 0011](docs/adr/0011-browser-upload-and-jobs.md) explains browser upload retries and job polling; [ADR 0012](docs/adr/0012-browser-research.md) explains visible evidence; [ADR 0013](docs/adr/0013-question-idempotency.md) explains replay and uncertain provider outcomes; [ADR 0014](docs/adr/0014-pdf-process-boundary.md) explains PDF parsing limits. Request, event, and job IDs appear in structured logs.
 
 ## Verification
 
@@ -100,6 +103,7 @@ PostgreSQL is the authority for identities, memberships, jobs, processed-event r
 npm run typecheck
 npm run lint
 npm run format:check
+npm run build
 npm run test -- tests/unit
 npm run typecheck --prefix web
 npm run test --prefix web
@@ -115,6 +119,8 @@ The integration tests clear application tables in their target database. Use a d
 ## Failure experiment
 
 Upload a file containing `%PDF-broken` as `application/pdf`. Poll its job: it moves through retries to `failed`, then appears in the failed-job list. Call `POST /jobs/:jobId/retry` and observe a new event for the same job. Also try the upload while Redis is stopped: the API still returns a queued job because the outbox is in PostgreSQL; publishing resumes when Redis returns.
+
+To experiment with the PDF boundary, set `PDF_EXTRACTION_TIMEOUT_MS=1` and restart the worker. Upload a valid PDF: its child process times out, then the job follows the normal retry and dead-letter path. Restore the default and manually retry that job; it should complete. A text upload should still process directly while the PDF deadline is set to 1 ms.
 
 For embedding recovery, interrupt a worker after one batch is saved, restart it, and observe that stored vectors are skipped. If the provider completed a request but the worker died before the batch commit, the external request may repeat; the usage endpoint counts committed batches, so it is an estimate.
 
