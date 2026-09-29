@@ -1,6 +1,6 @@
 # Document research platform
 
-An incremental, multi-tenant document research platform. **Current slice:** authentication, workspaces, a browser research desk with document uploads, job progress, grounded questions, citations, and usage; idempotent uploads and question replays; transactional outbox; workspace backlog control; BullMQ extraction and embedding with bounded PDF parsing; pgvector search; API and provider rate limits; operational metrics; retries; and dead-letter records.
+An incremental, multi-tenant document research platform. **Current slice:** authentication, workspaces, a browser research desk with private S3-compatible document uploads, job progress, grounded questions, citations, and usage; idempotent uploads and question replays; transactional outbox; workspace backlog control; BullMQ extraction and embedding with bounded PDF parsing; pgvector search; API and provider rate limits; operational metrics; retries; and dead-letter records.
 
 ## Local setup
 
@@ -13,7 +13,7 @@ curl http://localhost:3000/health/ready
 
 Open [http://localhost:3001](http://localhost:3001) to create an account and workspace. Open a workspace to upload PDF/text files, watch jobs, retry failures, ask questions, inspect cited excerpts, and see approximate AI usage. The browser app stores the API session in an encrypted HttpOnly cookie. Compose includes a development-only cookie key; set `WEB_SESSION_KEY` to `openssl rand -hex 32` in `.env` before sharing an environment. For local web development, run `npm ci --prefix web && npm run dev --prefix web` with `API_BASE_URL=http://localhost:3000`, `WEB_PUBLIC_ORIGIN=http://localhost:3001`, and `WEB_SESSION_KEY` set.
 
-For local API development, run `docker compose up -d postgres redis`, copy `.env.example` to `.env`, then `npm ci && npm run migrate && npm run dev`.
+Compose runs S3Mock privately inside its network and keeps objects in a named volume. For standalone API development, run `docker compose up -d postgres redis`, copy `.env.example` to `.env`, then `npm ci && npm run migrate && npm run dev`; `DOCUMENT_STORAGE=postgres` keeps this mode self-contained. Use the Compose API to exercise the S3 path locally.
 
 ## API example
 
@@ -61,6 +61,8 @@ PDF text extraction runs in a fresh child process with a 30-second deadline (`PD
 
 Generate a UUID `Idempotency-Key` for each intended upload. Reuse that key and the same file/filename when retrying after a lost response: the API returns `200` with the original IDs and current status. A reused key with different upload data returns `409`. A new key means a new upload, even for identical bytes.
 
+In Compose, the API stores validated bytes in the private object store before committing the document, job, and outbox event. A PostgreSQL staging reservation protects the object key from a conflicting retry. The worker checks the saved SHA-256 before extraction. If storage is unavailable, upload returns `503`; retry with the same key. A publisher cleanup pass deletes uncommitted staged objects after 24 hours. Existing PostgreSQL-backed documents remain readable. See ADR 0015. For AWS later, use a private bucket and IAM credentials; leave `S3_ENDPOINT` and static key variables unset.
+
 Questions also require a UUID `Idempotency-Key`. Reuse the same key, question, and `topK` after a lost response: a completed request returns its saved answer without another provider call. `409 question_in_progress` means retry the same key shortly. `409 question_outcome_unknown` means the process may have died during a provider call; check usage before deliberately starting a new attempt with a new key. The same key with changed parameters returns `409 idempotency_key_reused`. Browser retries keep the key in session storage until an answer arrives.
 
 The API accepts at most 20 queued or processing jobs per workspace by default (`MAX_PENDING_JOBS_PER_WORKSPACE`, 1–100). Upload, reindex, and manual retry return `429 workspace_job_limit` when full. A finished or failed job frees a slot. The worker still handles one active job per workspace; the cap bounds backlog but does not guarantee strict fairness in the shared queue.
@@ -84,18 +86,20 @@ flowchart LR
   Web --> API[Express API]
   CLI[API clients] --> API
   API --> PG[(PostgreSQL)]
+  API --> S3[(Private object store)]
   API --> Outbox[(Transactional outbox)]
   Outbox --> Publisher
   Publisher --> Redis[(Redis / BullMQ)]
   Redis --> Worker[Extraction and embedding worker]
   Worker --> PDF[Bounded PDF child process]
   Worker --> PG
+  Worker --> S3
   API --> Vector[pgvector exact search]
   Vector --> PG
   API --> LLM[Answer provider]
 ```
 
-PostgreSQL is the authority for identities, memberships, jobs, processed-event records, vectors, and usage. [ADR 0001](docs/adr/0001-workspace-boundary.md) records tenant isolation; [ADR 0002](docs/adr/0002-outbox-processing.md) explains delivery guarantees; [ADR 0003](docs/adr/0003-embeddings-and-search.md) explains vector checkpointing and search; [ADR 0004](docs/adr/0004-grounded-answers.md) explains citation validation and answer cost; [ADR 0005](docs/adr/0005-workspace-admission.md) explains workspace backlog limits; [ADR 0006](docs/adr/0006-upload-idempotency.md) explains upload retry safety; [ADR 0007](docs/adr/0007-api-rate-limits.md) explains edge limits and Redis outages; [ADR 0008](docs/adr/0008-operational-metrics.md) explains operational metrics; [ADR 0009](docs/adr/0009-provider-budget.md) explains provider capacity; [ADR 0010](docs/adr/0010-browser-session-boundary.md) explains the browser session boundary; [ADR 0011](docs/adr/0011-browser-upload-and-jobs.md) explains browser upload retries and job polling; [ADR 0012](docs/adr/0012-browser-research.md) explains visible evidence; [ADR 0013](docs/adr/0013-question-idempotency.md) explains replay and uncertain provider outcomes; [ADR 0014](docs/adr/0014-pdf-process-boundary.md) explains PDF parsing limits. Request, event, and job IDs appear in structured logs.
+PostgreSQL is the authority for identities, memberships, jobs, processed-event records, vectors, and usage. [ADR 0001](docs/adr/0001-workspace-boundary.md) records tenant isolation; [ADR 0002](docs/adr/0002-outbox-processing.md) explains delivery guarantees; [ADR 0003](docs/adr/0003-embeddings-and-search.md) explains vector checkpointing and search; [ADR 0004](docs/adr/0004-grounded-answers.md) explains citation validation and answer cost; [ADR 0005](docs/adr/0005-workspace-admission.md) explains workspace backlog limits; [ADR 0006](docs/adr/0006-upload-idempotency.md) explains upload retry safety; [ADR 0007](docs/adr/0007-api-rate-limits.md) explains edge limits and Redis outages; [ADR 0008](docs/adr/0008-operational-metrics.md) explains operational metrics; [ADR 0009](docs/adr/0009-provider-budget.md) explains provider capacity; [ADR 0010](docs/adr/0010-browser-session-boundary.md) explains the browser session boundary; [ADR 0011](docs/adr/0011-browser-upload-and-jobs.md) explains browser upload retries and job polling; [ADR 0012](docs/adr/0012-browser-research.md) explains visible evidence; [ADR 0013](docs/adr/0013-question-idempotency.md) explains replay and uncertain provider outcomes; [ADR 0014](docs/adr/0014-pdf-process-boundary.md) explains PDF parsing limits; [ADR 0015](docs/adr/0015-private-object-storage.md) explains private object storage and cleanup. Request, event, and job IDs appear in structured logs.
 
 ## Verification
 
@@ -129,6 +133,8 @@ For answer behavior, ask about a topic absent from all indexed documents. The lo
 For admission control, set `MAX_PENDING_JOBS_PER_WORKSPACE=1` and restart the API. Stop the worker, then upload two files to the same workspace: the first returns 202 and the second returns 429. Upload to another workspace to see its independent slot. Restart the worker; after the first job completes, the second upload can be retried.
 
 For HTTP retry safety, upload once with a UUID `Idempotency-Key` and repeat the same request with that key. The second response is 200 with the same IDs and no new outbox event. Change the file while keeping the key to see 409. Use a new key for a deliberately separate upload.
+
+For object storage failure, stop S3Mock (`docker compose stop s3mock`) and try a text upload. Expect `503 object_storage_unavailable`. Restart it and retry the same bytes, filename, and key; expect `202` and a completed job. Check that `documents.content` is null and `storage_key` and `content_sha256` are set for the new row. The integration test simulates a crash after PUT but before finalization and verifies replay and cleanup. S3Mock is a local API emulator, not a production security boundary.
 
 For rate limiting, set `API_REQUESTS_PER_MINUTE=2`, restart the API, and call `GET /workspaces` three times without a token: expect 401, 401, then 429 with `Retry-After`. `/health/live` remains available. With an existing bearer token, stop Redis and try an upload: the API can still create the PostgreSQL job and outbox event; registration and AI endpoints return 503 until Redis restarts.
 

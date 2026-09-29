@@ -12,6 +12,8 @@ import {
   configuredPendingJobLimit,
   requireWorkspaceCapacity,
 } from "../processing/admission";
+import type { ObjectStore } from "../storage/objects";
+import { lockedStagedUpload, reserveStagedUpload } from "../storage/staging";
 
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
 const upload = multer({
@@ -82,7 +84,7 @@ function uploadFingerprint(
     .digest("hex");
 }
 
-export function documentRoutes(pool: Pool): Router {
+export function documentRoutes(pool: Pool, objects?: ObjectStore): Router {
   const router = Router();
   const pendingLimit = configuredPendingJobLimit();
   router.use(requireUser(pool));
@@ -117,6 +119,59 @@ export function documentRoutes(pool: Pool): Router {
         req.get("Idempotency-Key"),
       );
       const fingerprint = uploadFingerprint(filename, mediaType, file!.buffer);
+      if (objects) {
+        const previous = await pool.query<{
+          request_fingerprint: string;
+          document_id: string;
+          job_id: string;
+          status: string;
+        }>(
+          `SELECT i.request_fingerprint, i.document_id, i.job_id, j.status
+           FROM upload_idempotency i
+           JOIN processing_jobs j ON j.workspace_id = i.workspace_id AND j.id = i.job_id
+           WHERE i.workspace_id = $1 AND i.idempotency_key = $2`,
+          [workspaceId, idempotencyKey],
+        );
+        if (previous.rows[0]) {
+          if (previous.rows[0].request_fingerprint !== fingerprint)
+            throw new HttpError(
+              409,
+              "idempotency_key_reused",
+              "Idempotency-Key was used for a different upload",
+            );
+          res.status(200).json({
+            documentId: previous.rows[0].document_id,
+            jobId: previous.rows[0].job_id,
+            status: previous.rows[0].status,
+          });
+          return;
+        }
+      }
+      const storageKey = objects
+        ? await reserveStagedUpload(
+            pool,
+            workspaceId,
+            res.locals.userId,
+            idempotencyKey,
+            fingerprint,
+            pendingLimit,
+          )
+        : undefined;
+      if (objects && storageKey) {
+        try {
+          await objects.put(storageKey, file!.buffer, mediaType);
+        } catch (error) {
+          req.log.error(
+            { err: error, workspaceId, uploadKey: idempotencyKey },
+            "object upload failed",
+          );
+          throw new HttpError(
+            503,
+            "object_storage_unavailable",
+            "Private file storage unavailable; retry with the same key",
+          );
+        }
+      }
       const client = await pool.connect();
       try {
         await client.query("BEGIN");
@@ -158,19 +213,31 @@ export function documentRoutes(pool: Pool): Router {
           });
           return;
         }
+        if (storageKey)
+          await lockedStagedUpload(
+            client,
+            workspaceId,
+            idempotencyKey,
+            fingerprint,
+          );
         await requireWorkspaceCapacity(client, workspaceId, pendingLimit);
         const documentId = randomUUID();
         const jobId = randomUUID();
         const eventId = randomUUID();
         await client.query(
-          "INSERT INTO documents (id, workspace_id, filename, media_type, content, status) VALUES ($1, $2, $3, $4, $5, $6)",
+          `INSERT INTO documents
+           (id, workspace_id, filename, media_type, content, storage_key, content_sha256, status)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued')`,
           [
             documentId,
             workspaceId,
             filename,
             mediaType,
-            file!.buffer,
-            "queued",
+            storageKey ? null : file!.buffer,
+            storageKey ?? null,
+            storageKey
+              ? createHash("sha256").update(file!.buffer).digest("hex")
+              : null,
           ],
         );
         await client.query(

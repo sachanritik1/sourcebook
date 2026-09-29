@@ -12,11 +12,13 @@ import {
 } from "./rate-limit/middleware";
 import { QUEUE_NAME } from "./processing/types";
 import { limitAnswers, limitEmbeddings } from "./ai/provider-budget";
+import { configuredObjectStore } from "./storage/objects";
 
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) throw new Error("DATABASE_URL is required");
 
 const pool = createPool(databaseUrl);
+const objects = configuredObjectStore();
 const redisUrl = process.env.REDIS_URL;
 if (!redisUrl) throw new Error("REDIS_URL is required");
 const redis = new IORedis(redisUrl, {
@@ -53,6 +55,7 @@ const metricsQueue = metricsToken
   : null;
 const port = Number(process.env.PORT ?? 3000);
 const server = createApp(pool, {
+  objects,
   embeddings,
   limiter: new FixedWindowLimiter(redis, 10, "search-limit"),
   answers,

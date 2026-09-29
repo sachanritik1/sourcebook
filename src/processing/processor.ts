@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import {
   INDEX_BATCH_SIZE,
@@ -8,11 +9,14 @@ import {
 import { chunkText } from "./chunks";
 import { extractText } from "./extract";
 import type { DocumentEvent } from "./types";
+import type { ObjectStore } from "../storage/objects";
 
 export class WorkspaceBusyError extends Error {}
 
 type StoredDocument = {
-  content: Buffer;
+  content: Buffer | null;
+  storage_key: string | null;
+  content_sha256: string | null;
   media_type: string;
   current_event_id: string;
   status: string;
@@ -41,6 +45,7 @@ export async function processDocumentEvent(
   event: DocumentEvent,
   attempt: number,
   embeddings: EmbeddingProvider,
+  objects?: ObjectStore,
 ): Promise<void> {
   const client = await pool.connect();
   let locked = false;
@@ -54,7 +59,8 @@ export async function processDocumentEvent(
       throw new WorkspaceBusyError("Workspace already has a processing job");
 
     const result = await client.query<StoredDocument>(
-      `SELECT d.content, d.media_type, j.current_event_id, j.status
+      `SELECT d.content, d.storage_key, d.content_sha256,
+              d.media_type, j.current_event_id, j.status
        FROM processing_jobs j JOIN documents d ON d.workspace_id = j.workspace_id AND d.id = j.document_id
        WHERE j.id = $1 AND j.workspace_id = $2 AND j.document_id = $3`,
       [event.jobId, event.workspaceId, event.documentId],
@@ -79,7 +85,17 @@ export async function processDocumentEvent(
     );
     if (Number(existingChunks.rows[0]?.count) === 0) {
       await setProgress(client, event, "extracting", 20, attempt);
-      const text = await extractText(document.content, document.media_type);
+      let content = document.content;
+      if (document.storage_key) {
+        if (!objects)
+          throw new Error("Private object storage is not configured");
+        content = await objects.get(document.storage_key);
+        const digest = createHash("sha256").update(content).digest("hex");
+        if (digest !== document.content_sha256)
+          throw new Error("Stored document checksum mismatch");
+      }
+      if (!content) throw new Error("Document has no stored content");
+      const text = await extractText(content, document.media_type);
       await setProgress(client, event, "chunking", 50, attempt);
       const chunks = chunkText(text);
       if (chunks.length > 500)

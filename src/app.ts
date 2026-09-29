@@ -16,6 +16,7 @@ import type { AnswerProvider } from "./ai/answers";
 import { ipRateLimit } from "./rate-limit/middleware";
 import type { Queue } from "bullmq";
 import { metricsRoutes } from "./observability/metrics";
+import type { ObjectStore } from "./storage/objects";
 
 export function createApp(
   pool: Pool,
@@ -28,6 +29,7 @@ export function createApp(
     authLimiter?: RateCounter;
     trustProxyHops?: number;
     metrics?: { queue: Pick<Queue, "getJobCounts">; token: string };
+    objects?: ObjectStore;
   },
 ) {
   const app = express();
@@ -80,7 +82,7 @@ export function createApp(
     );
   app.use("/auth", authRoutes(pool));
   app.use("/workspaces", workspaceRoutes(pool));
-  app.use("/workspaces", documentRoutes(pool));
+  app.use("/workspaces", documentRoutes(pool, services?.objects));
   app.use("/workspaces", workspaceJobRoutes(pool));
   if (services)
     app.use(

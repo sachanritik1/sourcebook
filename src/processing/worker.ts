@@ -19,6 +19,7 @@ import {
 } from "./processor";
 import { documentEventSchema, QUEUE_NAME, type DocumentEvent } from "./types";
 import { providerAwareBackoff } from "./backoff";
+import { configuredObjectStore, type ObjectStore } from "../storage/objects";
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? "info" });
 
@@ -27,11 +28,12 @@ export async function processQueuedDocument(
   job: Job<DocumentEvent>,
   token: string | undefined,
   embeddings: EmbeddingProvider,
+  objects?: ObjectStore,
 ): Promise<void> {
   const event = documentEventSchema.parse(job.data);
   const attempt = job.attemptsMade + 1;
   try {
-    await processDocumentEvent(pool, event, attempt, embeddings);
+    await processDocumentEvent(pool, event, attempt, embeddings, objects);
     logger.info(
       {
         eventId: event.eventId,
@@ -95,6 +97,7 @@ async function main() {
   if (!databaseUrl || !redisUrl)
     throw new Error("DATABASE_URL and REDIS_URL are required");
   const pool = createPool(databaseUrl);
+  const objects = configuredObjectStore();
   const baseEmbeddings = createEmbeddingProvider();
   const budgetConnection =
     process.env.EMBEDDING_PROVIDER === "openai"
@@ -116,7 +119,8 @@ async function main() {
   const connection = new IORedis(redisUrl, { maxRetriesPerRequest: null });
   const worker = new Worker(
     QUEUE_NAME,
-    (job, token) => processQueuedDocument(pool, job, token, embeddings),
+    (job, token) =>
+      processQueuedDocument(pool, job, token, embeddings, objects),
     {
       connection,
       concurrency: 4,

@@ -8,6 +8,8 @@ import { createQueue } from "./queue";
 import { documentEventSchema } from "./types";
 import { recordFailure } from "./processor";
 import { PROVIDER_AWARE_BACKOFF } from "./backoff";
+import { configuredObjectStore } from "../storage/objects";
+import { cleanupStagedUploads } from "../storage/staging";
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? "info" });
 
@@ -119,6 +121,7 @@ async function main() {
   if (!databaseUrl || !redisUrl)
     throw new Error("DATABASE_URL and REDIS_URL are required");
   const pool = createPool(databaseUrl);
+  const objects = configuredObjectStore();
   const { queue, connection } = createQueue(redisUrl);
   let stopping = false;
   let polls = 0;
@@ -133,6 +136,8 @@ async function main() {
       try {
         await publishPending(pool, queue);
         if (++polls % 30 === 0) await reconcileJobs(pool, queue);
+        if (objects && polls % 60 === 0)
+          await cleanupStagedUploads(pool, objects);
       } catch (error) {
         logger.error({ err: error }, "outbox poll failed");
       }
