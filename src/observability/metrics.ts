@@ -23,7 +23,7 @@ export function metricsRoutes(
     if (!validToken(req.header("authorization"), token))
       throw new HttpError(401, "unauthorized", "Metrics token required");
 
-    const [jobs, outbox, usage, queueCounts] = await Promise.all([
+    const [jobs, outbox, usage, deletions, queueCounts] = await Promise.all([
       pool.query(`SELECT
         count(*) FILTER (WHERE status = 'queued')::int AS queued,
         count(*) FILTER (WHERE status = 'processing')::int AS processing,
@@ -43,6 +43,10 @@ export function metricsRoutes(
         coalesce(sum(output_tokens) FILTER (WHERE operation = 'llm_answer'), 0)::bigint AS "answerOutputTokens",
         coalesce(sum(input_tokens) FILTER (WHERE operation <> 'llm_answer'), 0)::bigint AS "embeddingInputTokens"
         FROM usage_events`),
+      pool.query(`SELECT count(*)::int AS pending,
+        coalesce(sum(greatest(attempts - 1, 0)), 0)::bigint AS retries,
+        round(extract(epoch from now() - min(requested_at)))::bigint AS "oldestAgeSeconds"
+        FROM document_deletions`),
       queue.getJobCounts("waiting", "active", "delayed", "failed").catch(() => {
         throw new HttpError(
           503,
@@ -54,11 +58,20 @@ export function metricsRoutes(
     const jobRow = jobs.rows[0];
     const outboxRow = outbox.rows[0];
     const usageRow = usage.rows[0];
+    const deletionRow = deletions.rows[0];
     res.json({
       queue: queueCounts,
       outbox: {
         pending: Number(outboxRow.pending),
         publishRetries: Number(outboxRow.publishRetries),
+      },
+      documentDeletions: {
+        pending: Number(deletionRow.pending),
+        retries: Number(deletionRow.retries),
+        oldestAgeSeconds:
+          deletionRow.oldestAgeSeconds === null
+            ? null
+            : Number(deletionRow.oldestAgeSeconds),
       },
       jobs: {
         queued: Number(jobRow.queued),

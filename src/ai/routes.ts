@@ -305,6 +305,7 @@ export function aiRoutes(
         }
         const response = grounded && { ...grounded, model: answers.model };
         const client = await pool.connect();
+        let evidenceUnavailable: HttpError | undefined;
         try {
           await client.query("BEGIN");
           await client.query(
@@ -320,8 +321,15 @@ export function aiRoutes(
               llmLatencyMs,
             ],
           );
-          if (response)
-            await completeQuestion(client, workspaceId, key.data, response);
+          if (response) {
+            try {
+              await completeQuestion(client, workspaceId, key.data, response);
+            } catch (error) {
+              if (error instanceof HttpError && error.status === 410)
+                evidenceUnavailable = error;
+              else throw error;
+            }
+          }
           await client.query("COMMIT");
         } catch (error) {
           await client.query("ROLLBACK");
@@ -329,6 +337,7 @@ export function aiRoutes(
         } finally {
           client.release();
         }
+        if (evidenceUnavailable) throw evidenceUnavailable;
         if (invalidCitation)
           throw new HttpError(
             502,

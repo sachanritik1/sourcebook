@@ -35,7 +35,7 @@ async function setProgress(
     [event.jobId, event.eventId, stage, progress, attempt],
   );
   await client.query(
-    "UPDATE documents SET status = 'processing', updated_at = now() WHERE id = $1 AND workspace_id = $2",
+    "UPDATE documents SET status = 'processing', updated_at = now() WHERE id = $1 AND workspace_id = $2 AND status NOT IN ('deleting', 'deleted')",
     [event.documentId, event.workspaceId],
   );
 }
@@ -70,7 +70,9 @@ export async function processDocumentEvent(
       !document ||
       document.current_event_id !== event.eventId ||
       document.status === "completed" ||
-      document.status === "failed"
+      document.status === "failed" ||
+      document.status === "deleting" ||
+      document.status === "deleted"
     )
       return;
     const processed = await client.query(
@@ -252,7 +254,7 @@ export async function processDocumentEvent(
         [event.jobId],
       );
       await client.query(
-        "UPDATE documents SET status = 'completed', updated_at = now() WHERE id = $1 AND workspace_id = $2",
+        "UPDATE documents SET status = 'completed', updated_at = now() WHERE id = $1 AND workspace_id = $2 AND status NOT IN ('deleting', 'deleted')",
         [event.documentId, event.workspaceId],
       );
       await client.query("COMMIT");
@@ -312,7 +314,7 @@ export async function recordFailure(
       ],
     );
     await client.query(
-      "UPDATE documents SET status = $3, updated_at = now() WHERE id = $1 AND workspace_id = $2",
+      "UPDATE documents SET status = $3, updated_at = now() WHERE id = $1 AND workspace_id = $2 AND status NOT IN ('deleting', 'deleted')",
       [event.documentId, event.workspaceId, final ? "failed" : "queued"],
     );
     if (final) {

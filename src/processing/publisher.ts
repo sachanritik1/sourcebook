@@ -10,6 +10,10 @@ import { recordFailure } from "./processor";
 import { PROVIDER_AWARE_BACKOFF } from "./backoff";
 import { configuredObjectStore } from "../storage/objects";
 import { cleanupStagedUploads } from "../storage/staging";
+import {
+  expireDocuments,
+  processDocumentDeletions,
+} from "../documents/deletion";
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? "info" });
 
@@ -138,6 +142,12 @@ async function main() {
         if (++polls % 30 === 0) await reconcileJobs(pool, queue);
         if (objects && polls % 60 === 0)
           await cleanupStagedUploads(pool, objects);
+        if (polls % 60 === 0) {
+          const expired = await expireDocuments(pool);
+          const deletions = await processDocumentDeletions(pool, objects);
+          if (expired || deletions.completed || deletions.failed)
+            logger.info({ expired, ...deletions }, "document retention pass");
+        }
       } catch (error) {
         logger.error({ err: error }, "outbox poll failed");
       }

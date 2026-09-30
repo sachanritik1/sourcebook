@@ -30,6 +30,26 @@ export async function reserveStagedUpload(
     if (!member.rowCount)
       throw new HttpError(404, "workspace_not_found", "Workspace not found");
     await acquireWorkspaceAdmission(client, workspaceId);
+    const finalized = await client.query<{
+      status: string;
+      expired: boolean;
+    }>(
+      `SELECT d.status, (d.expires_at IS NOT NULL AND d.expires_at <= now()) AS expired
+       FROM upload_idempotency i JOIN documents d
+         ON d.workspace_id = i.workspace_id AND d.id = i.document_id
+       WHERE i.workspace_id = $1 AND i.idempotency_key = $2`,
+      [workspaceId, idempotencyKey],
+    );
+    if (
+      finalized.rows[0] &&
+      (["deleting", "deleted"].includes(finalized.rows[0].status) ||
+        finalized.rows[0].expired)
+    )
+      throw new HttpError(
+        410,
+        "document_deleted",
+        "Document is no longer available",
+      );
     const previous = await client.query<StagedUpload>(
       `SELECT request_fingerprint, object_key, status FROM upload_staging
        WHERE workspace_id = $1 AND idempotency_key = $2`,

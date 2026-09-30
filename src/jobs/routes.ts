@@ -13,7 +13,11 @@ const jobSelect = `SELECT j.id, j.document_id AS "documentId", j.workspace_id AS
   j.status, j.stage, j.progress, j.attempts_made AS "attemptsMade",
   j.max_attempts AS "maxAttempts", j.last_error AS "lastError",
   j.created_at AS "createdAt", j.updated_at AS "updatedAt", j.finished_at AS "finishedAt"
-  FROM processing_jobs j JOIN workspace_memberships m ON m.workspace_id = j.workspace_id`;
+  FROM processing_jobs j
+  JOIN documents d ON d.workspace_id = j.workspace_id AND d.id = j.document_id
+    AND d.status NOT IN ('deleting', 'deleted')
+    AND (d.expires_at IS NULL OR d.expires_at > now())
+  JOIN workspace_memberships m ON m.workspace_id = j.workspace_id`;
 
 export function jobRoutes(pool: Pool): Router {
   const router = Router();
@@ -39,16 +43,30 @@ export function jobRoutes(pool: Pool): Router {
       const result = await client.query<{
         workspace_id: string;
         document_id: string;
-        status: string;
+        document_status: string;
+        expired: boolean;
       }>(
-        `SELECT j.workspace_id, j.document_id, j.status FROM processing_jobs j
+        `SELECT j.workspace_id, j.document_id, d.status AS document_status,
+                (d.expires_at IS NOT NULL AND d.expires_at <= now()) AS expired
+         FROM processing_jobs j
+         JOIN documents d ON d.workspace_id = j.workspace_id AND d.id = j.document_id
          JOIN workspace_memberships m ON m.workspace_id = j.workspace_id
-         WHERE j.id = $1 AND m.user_id = $2 FOR UPDATE OF j`,
+         WHERE j.id = $1 AND m.user_id = $2 FOR UPDATE OF d`,
         [jobId, res.locals.userId],
       );
       const job = result.rows[0];
       if (!job) throw new HttpError(404, "job_not_found", "Job not found");
-      if (job.status !== "failed")
+      if (["deleting", "deleted"].includes(job.document_status) || job.expired)
+        throw new HttpError(
+          410,
+          "document_deleted",
+          "Document is no longer available",
+        );
+      const locked = await client.query<{ status: string }>(
+        "SELECT status FROM processing_jobs WHERE id = $1 FOR UPDATE",
+        [jobId],
+      );
+      if (locked.rows[0]?.status !== "failed")
         throw new HttpError(
           409,
           "job_not_failed",

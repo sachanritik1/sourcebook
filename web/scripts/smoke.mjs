@@ -217,6 +217,48 @@ const crossOriginQuestion = await fetch(
 );
 assert.equal(crossOriginQuestion.status, 403);
 
+const deletePath = `/api/workspaces/${workspace.id}/documents/${firstBody.documentId}`;
+assert.equal(
+  (await request(deletePath, other, { method: "DELETE" })).status,
+  404,
+);
+const wrongOriginDelete = await fetch(`${origin}${deletePath}`, {
+  method: "DELETE",
+  headers: { Cookie: owner, Origin: "https://other.example" },
+});
+assert.equal(wrongOriginDelete.status, 403);
+assert.equal(
+  (await request(deletePath, owner, { method: "DELETE" })).status,
+  202,
+);
+assert.equal(
+  (await ask(owner, "What does the source note say?", answerKey)).status,
+  410,
+);
+assert.equal(
+  (
+    await upload(
+      workspace.id,
+      owner,
+      key,
+      "source.txt",
+      "A short source note.",
+      "text/plain",
+    )
+  ).status,
+  410,
+);
+const afterDelete = await request(
+  `/api/workspaces/${workspace.id}/documents`,
+  owner,
+);
+assert.equal(afterDelete.status, 200);
+assert.ok(
+  !(await afterDelete.json()).documents.some(
+    (item) => item.id === firstBody.documentId,
+  ),
+);
+
 const failedUpload = await upload(
   workspace.id,
   owner,
@@ -248,5 +290,5 @@ const wrongOrigin = await fetch(
 assert.equal(wrongOrigin.status, 403);
 
 console.log(
-  "PASS upload and answer replay, PDF extraction, tenant isolation, usage, job retry, origin check",
+  "PASS upload and answer replay, deletion, PDF extraction, tenant isolation, usage, job retry, origin check",
 );

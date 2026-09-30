@@ -10,6 +10,7 @@ type Document = {
   filename: string;
   status: string;
   createdAt: string;
+  expiresAt: string | null;
 };
 type Job = {
   id: string;
@@ -37,6 +38,11 @@ function requestError(status: number, body: Record<string, unknown>): string {
   if (status === 429 && body.error === "workspace_job_limit")
     return "This workspace has too many pending jobs. Try again after one finishes.";
   if (status === 429) return "Too many requests. Wait a moment and retry.";
+  if (status === 403 && body.error === "owner_required")
+    return "Only a workspace owner can delete documents.";
+  if (status === 410) return "This document is no longer available.";
+  if (status === 409 && body.error === "document_processing")
+    return "Wait for processing to finish before deleting.";
   if (status === 409)
     return "This upload key was used for different content. Remove and re-add the file.";
   if (status === 503)
@@ -60,6 +66,8 @@ export default function ResearchWorkspace({
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
   const [retryingJob, setRetryingJob] = useState<string | null>(null);
+  const [deletingDocument, setDeletingDocument] = useState<string | null>(null);
+  const [answersVersion, setAnswersVersion] = useState(0);
   const [message, setMessage] = useState("");
 
   const refresh = useCallback(async () => {
@@ -204,6 +212,38 @@ export default function ResearchWorkspace({
     }
   }
 
+  async function deleteDocument(item: Document) {
+    if (
+      !window.confirm(
+        `Delete ${item.filename}? Its source and search chunks will be removed.`,
+      )
+    )
+      return;
+    setDeletingDocument(item.id);
+    setMessage("");
+    try {
+      const response = await fetch(
+        `/api/workspaces/${workspace.id}/documents/${item.id}`,
+        { method: "DELETE" },
+      );
+      if (response.status === 401) {
+        onUnauthorized();
+        return;
+      }
+      const body = response.status === 204 ? {} : await payload(response);
+      if (!response.ok) throw new Error(requestError(response.status, body));
+      setAnswersVersion((current) => current + 1);
+      await refresh();
+      setMessage("Document hidden. Private storage cleanup is in progress.");
+    } catch (error) {
+      setMessage(
+        error instanceof Error ? error.message : "Could not delete document.",
+      );
+    } finally {
+      setDeletingDocument(null);
+    }
+  }
+
   return (
     <section className="research" aria-labelledby="research-title">
       <button className="back-link" type="button" onClick={onBack}>
@@ -251,11 +291,25 @@ export default function ResearchWorkspace({
                     <span>
                       {new Date(item.createdAt).toLocaleDateString()} ·{" "}
                       {item.id.slice(0, 8)}
+                      {item.expiresAt &&
+                        ` · expires ${new Date(item.expiresAt).toLocaleDateString()}`}
                     </span>
                   </div>
                   <span className={`status status-${item.status}`}>
                     {item.status}
                   </span>
+                  {workspace.role === "owner" &&
+                    (item.status === "completed" ||
+                      item.status === "failed") && (
+                      <button
+                        className="text-button"
+                        type="button"
+                        disabled={deletingDocument === item.id}
+                        onClick={() => void deleteDocument(item)}
+                      >
+                        {deletingDocument === item.id ? "Deleting…" : "Delete"}
+                      </button>
+                    )}
                 </div>
               ))}
             </div>
@@ -399,6 +453,7 @@ export default function ResearchWorkspace({
         </div>
       </div>
       <ResearchAnswers
+        key={answersVersion}
         workspaceId={workspace.id}
         hasCompletedDocument={documents.some(
           (item) => item.status === "completed",

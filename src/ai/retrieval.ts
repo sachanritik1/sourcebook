@@ -24,6 +24,7 @@ export async function retrieveChunks(
      JOIN document_chunks c ON c.workspace_id = e.workspace_id AND c.id = e.chunk_id
      JOIN documents d ON d.workspace_id = c.workspace_id AND d.id = c.document_id
      WHERE e.workspace_id = $1 AND e.model = $4 AND d.status = 'completed'
+       AND (d.expires_at IS NULL OR d.expires_at > now())
        AND EXISTS (SELECT 1 FROM workspace_memberships m WHERE m.workspace_id = e.workspace_id AND m.user_id = $2)
      ORDER BY e.embedding <=> $3::vector, c.id
      LIMIT $5`,

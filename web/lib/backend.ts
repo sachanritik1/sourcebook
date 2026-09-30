@@ -41,7 +41,7 @@ export async function readJson(request: Request): Promise<unknown> {
 export async function backend(
   path: string,
   options: {
-    method: "GET" | "POST";
+    method: "GET" | "POST" | "DELETE";
     token?: string;
     body?: unknown;
     form?: FormData;

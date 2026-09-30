@@ -59,6 +59,7 @@ services:
       DATABASE_URL: postgres://app:app@postgres:5432/research
       REDIS_URL: redis://redis:6379
       DOCUMENT_STORAGE: s3
+      DOCUMENT_RETENTION_DAYS: ${DOCUMENT_RETENTION_DAYS:-0}
       S3_ENDPOINT: http://s3mock:9090
       S3_BUCKET: research-private
       S3_REGION: us-east-1

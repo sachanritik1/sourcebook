@@ -1,6 +1,6 @@
 # Document research platform
 
-An incremental, multi-tenant document research platform. **Current slice:** authentication, workspaces, a browser research desk with private S3-compatible document uploads, job progress, grounded questions, citations, and usage; idempotent uploads and question replays; transactional outbox; workspace backlog control; BullMQ extraction and embedding with bounded PDF parsing; pgvector search; API and provider rate limits; operational metrics; retries; and dead-letter records.
+An incremental, multi-tenant document research platform. **Current slice:** authentication, workspaces, a browser research desk with private S3-compatible document uploads, owner-controlled deletion and optional expiry, job progress, grounded questions, citations, and usage; idempotent uploads and question replays; transactional outbox; workspace backlog control; BullMQ extraction and embedding with bounded PDF parsing; pgvector search; API and provider rate limits; operational metrics; retries; and dead-letter records.
 
 ## Local setup
 
@@ -53,9 +53,16 @@ curl -X POST http://localhost:3000/workspaces/<workspace-id>/questions \
 
 curl http://localhost:3000/workspaces/<workspace-id>/usage \
   -H 'authorization: Bearer <token>'
+
+# After processing, a workspace owner can request source deletion:
+curl -X DELETE http://localhost:3000/workspaces/<workspace-id>/documents/<document-id> \
+  -H 'authorization: Bearer <token>'
+# Returns 202 while cleanup is pending, then 204 on a repeated call.
 ```
 
 `POST /auth/login` accepts the same credentials. `POST /auth/logout` revokes the bearer token. `GET /workspaces` lists only memberships for the caller. A nonmember receives 404 for workspace, document, and job IDs. Files are never served directly. Uploads accept one PDF or UTF-8 text file up to 5 MB per request. `GET /workspaces/:workspaceId/documents` lists document metadata. `GET /workspaces/:workspaceId/jobs?status=failed` lists failed jobs; `POST /jobs/:jobId/retry` retries one. Set `MAX_PROCESSING_ATTEMPTS` from 1 to 10 to change the retry budget for new jobs.
+
+Workspace owners can call `DELETE /workspaces/:workspaceId/documents/:documentId` after a document completes or fails. It returns `202` and hides the document and its citations immediately; the publisher retries private-object cleanup until it succeeds. Repeating the request returns `202` while deleting and `204` after cleanup. Active jobs return `409`. A minimal redacted tombstone keeps upload keys and usage history stable. Set `DOCUMENT_RETENTION_DAYS` from 1 to 3650 to expire newly uploaded documents automatically; `0` (default) disables expiry. Existing documents keep their original expiry. See ADR 0016.
 
 PDF text extraction runs in a fresh child process with a 30-second deadline (`PDF_EXTRACTION_TIMEOUT_MS`, 1–120000), a 128 MB Node old-heap limit, and bounded output. This contains a parser crash or timeout to one job; it is not an OS sandbox for hostile PDFs. See ADR 0014.
 
@@ -76,7 +83,7 @@ The API allows 120 requests per client IP per minute by default (`API_REQUESTS_P
 When using OpenAI, the API and worker share an embedding request budget of 60 calls per minute by default (`EMBEDDING_REQUESTS_PER_MINUTE`). Answer calls have a separate 30-per-minute budget (`ANSWER_REQUESTS_PER_MINUTE`). Set these below your provider account's limits. A full budget returns 503 with `Retry-After` on synchronous AI routes and delays worker jobs without consuming a processing failure attempt. The local adapters do not use these budgets. These counters limit requests, not tokens; provider limits can still be lower. See ADR 0009.
 Temporary provider 429 responses count against the worker's retry budget and respect `Retry-After`; known credit, spend, and usage-limit errors fail immediately and appear in the dead-letter list. After fixing the provider account, use the existing manual job retry endpoint.
 
-Set `METRICS_TOKEN` to a random secret of at least 32 characters to enable `GET /internal/metrics`. Send `Authorization: Bearer <metrics-token>`. The global snapshot includes BullMQ queue depth, pending outbox events, job status and end-to-end time, retry attempts for current job events, answer latency, and token totals. Keep this endpoint behind a private network in deployment. See ADR 0008 for metric definitions and limits.
+Set `METRICS_TOKEN` to a random secret of at least 32 characters to enable `GET /internal/metrics`. Send `Authorization: Bearer <metrics-token>`. The global snapshot includes BullMQ queue depth, pending outbox and document deletions, job status and end-to-end time, retry attempts for current job events, answer latency, and token totals. Keep this endpoint behind a private network in deployment. See ADR 0008 for metric definitions and limits.
 
 ## Architecture
 
@@ -99,7 +106,7 @@ flowchart LR
   API --> LLM[Answer provider]
 ```
 
-PostgreSQL is the authority for identities, memberships, jobs, processed-event records, vectors, and usage. [ADR 0001](docs/adr/0001-workspace-boundary.md) records tenant isolation; [ADR 0002](docs/adr/0002-outbox-processing.md) explains delivery guarantees; [ADR 0003](docs/adr/0003-embeddings-and-search.md) explains vector checkpointing and search; [ADR 0004](docs/adr/0004-grounded-answers.md) explains citation validation and answer cost; [ADR 0005](docs/adr/0005-workspace-admission.md) explains workspace backlog limits; [ADR 0006](docs/adr/0006-upload-idempotency.md) explains upload retry safety; [ADR 0007](docs/adr/0007-api-rate-limits.md) explains edge limits and Redis outages; [ADR 0008](docs/adr/0008-operational-metrics.md) explains operational metrics; [ADR 0009](docs/adr/0009-provider-budget.md) explains provider capacity; [ADR 0010](docs/adr/0010-browser-session-boundary.md) explains the browser session boundary; [ADR 0011](docs/adr/0011-browser-upload-and-jobs.md) explains browser upload retries and job polling; [ADR 0012](docs/adr/0012-browser-research.md) explains visible evidence; [ADR 0013](docs/adr/0013-question-idempotency.md) explains replay and uncertain provider outcomes; [ADR 0014](docs/adr/0014-pdf-process-boundary.md) explains PDF parsing limits; [ADR 0015](docs/adr/0015-private-object-storage.md) explains private object storage and cleanup. Request, event, and job IDs appear in structured logs.
+PostgreSQL is the authority for identities, memberships, jobs, processed-event records, vectors, and usage. [ADR 0001](docs/adr/0001-workspace-boundary.md) records tenant isolation; [ADR 0002](docs/adr/0002-outbox-processing.md) explains delivery guarantees; [ADR 0003](docs/adr/0003-embeddings-and-search.md) explains vector checkpointing and search; [ADR 0004](docs/adr/0004-grounded-answers.md) explains citation validation and answer cost; [ADR 0005](docs/adr/0005-workspace-admission.md) explains workspace backlog limits; [ADR 0006](docs/adr/0006-upload-idempotency.md) explains upload retry safety; [ADR 0007](docs/adr/0007-api-rate-limits.md) explains edge limits and Redis outages; [ADR 0008](docs/adr/0008-operational-metrics.md) explains operational metrics; [ADR 0009](docs/adr/0009-provider-budget.md) explains provider capacity; [ADR 0010](docs/adr/0010-browser-session-boundary.md) explains the browser session boundary; [ADR 0011](docs/adr/0011-browser-upload-and-jobs.md) explains browser upload retries and job polling; [ADR 0012](docs/adr/0012-browser-research.md) explains visible evidence; [ADR 0013](docs/adr/0013-question-idempotency.md) explains replay and uncertain provider outcomes; [ADR 0014](docs/adr/0014-pdf-process-boundary.md) explains PDF parsing limits; [ADR 0015](docs/adr/0015-private-object-storage.md) explains private object storage and cleanup; [ADR 0016](docs/adr/0016-document-deletion-and-retention.md) explains deletion and expiry. Request, event, and job IDs appear in structured logs.
 
 ## Verification
 
@@ -135,6 +142,8 @@ For admission control, set `MAX_PENDING_JOBS_PER_WORKSPACE=1` and restart the AP
 For HTTP retry safety, upload once with a UUID `Idempotency-Key` and repeat the same request with that key. The second response is 200 with the same IDs and no new outbox event. Change the file while keeping the key to see 409. Use a new key for a deliberately separate upload.
 
 For object storage failure, stop S3Mock (`docker compose stop s3mock`) and try a text upload. Expect `503 object_storage_unavailable`. Restart it and retry the same bytes, filename, and key; expect `202` and a completed job. Check that `documents.content` is null and `storage_key` and `content_sha256` are set for the new row. The integration test simulates a crash after PUT but before finalization and verifies replay and cleanup. S3Mock is a local API emulator, not a production security boundary.
+
+For deletion, upload and finish a text document, then delete it as the workspace owner. It disappears from lists and search immediately. The private object remains for a two-minute grace period covering an upload retry already in flight; then the publisher deletes it and redacts the document row. Stop S3Mock during cleanup to see `document_deletions.attempts` and `last_error` rise; restart it and verify cleanup resumes. `GET /internal/metrics` includes the deletion backlog and oldest age. For expiry, set `DOCUMENT_RETENTION_DAYS=1`, restart the API, upload a file, and move its `expires_at` into the past in a test database; retrieval stops immediately and the publisher schedules cleanup after the job reaches a terminal state.
 
 For rate limiting, set `API_REQUESTS_PER_MINUTE=2`, restart the API, and call `GET /workspaces` three times without a token: expect 401, 401, then 429 with `Retry-After`. `/health/live` remains available. With an existing bearer token, stop Redis and try an upload: the API can still create the PostgreSQL job and outbox event; registration and AI endpoints return 503 until Redis restarts.
 
