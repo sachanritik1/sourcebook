@@ -1,8 +1,8 @@
 {
-  "name": "document-research-platform",
+  "name": "sourcebook",
   "version": "0.1.0",
   "private": true,
-  "description": "Multi-tenant document research platform",
+  "description": "Sourcebook: document research with inspectable citations",
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "build": "tsc",

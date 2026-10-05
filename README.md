@@ -1,4 +1,8 @@
-# Document research platform
+# Sourcebook
+
+A document research workspace that connects answers to inspectable source excerpts. Built with TypeScript, Express, Next.js, PostgreSQL/pgvector, and BullMQ.
+
+> Local MVP: deterministic development adapters run without API keys. Real AI providers are optional; production deployment and real-provider end-to-end behavior have not been validated.
 
 An incremental, multi-tenant document research platform. **Current slice:** authentication, workspaces, a browser research desk with private S3-compatible document uploads, owner-controlled deletion and optional expiry, job progress, grounded questions, citations, and usage; idempotent uploads and question replays; transactional outbox; workspace backlog control; BullMQ extraction and embedding with bounded PDF parsing; pgvector search; API and provider rate limits; operational metrics; retries; and dead-letter records.
 
